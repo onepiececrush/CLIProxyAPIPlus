@@ -40,6 +40,15 @@ type ErrorDetail struct {
 	Code string `json:"code,omitempty"`
 }
 
+// ModelMapper provides model name mapping/aliasing for API requests.
+// When a request comes in for a model that isn't available locally,
+// this mapper can redirect it to an alternative model that IS available.
+type ModelMapper interface {
+	// MapModel returns the target model name if a mapping exists and the target
+	// model has available providers. Returns empty string if no mapping applies.
+	MapModel(requestedModel string) string
+}
+
 // BaseAPIHandler contains the handlers for API endpoints.
 // It holds a pool of clients to interact with the backend service and manages
 // load balancing, client selection, and configuration.
@@ -49,6 +58,10 @@ type BaseAPIHandler struct {
 
 	// Cfg holds the current application configuration.
 	Cfg *config.SDKConfig
+
+	// ModelMapper provides global model name mapping for all API endpoints.
+	// When a requested model has no provider, the mapper can redirect to an available model.
+	ModelMapper ModelMapper
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -336,6 +349,12 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 }
 
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, metadata map[string]any, err *interfaces.ErrorMessage) {
+	return h.getRequestDetailsWithMapping(modelName, nil)
+}
+
+// getRequestDetailsWithMapping resolves model details and optionally applies model mapping.
+// If mappedModelOut is non-nil and a mapping was applied, it will be set to the mapped model name.
+func (h *BaseAPIHandler) getRequestDetailsWithMapping(modelName string, mappedModelOut *string) (providers []string, normalizedModel string, metadata map[string]any, err *interfaces.ErrorMessage) {
 	// Resolve "auto" model to an actual available model first
 	resolvedModelName := util.ResolveAutoModel(modelName)
 
@@ -353,6 +372,56 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 						providers = altProviders
 						normalizedModel = originalModel
 					}
+				}
+			}
+		}
+	}
+
+	// 如果没有找到 provider，尝试使用全局模型映射
+	// If no provider found, try global model mapping
+	if len(providers) == 0 && h.ModelMapper != nil {
+		// 尝试映射原始模型名
+		mappedModel := h.ModelMapper.MapModel(modelName)
+		if mappedModel == "" {
+			// 尝试映射规范化后的模型名
+			mappedModel = h.ModelMapper.MapModel(normalizedModel)
+		}
+
+		if mappedModel != "" {
+			// 保留动态思考后缀
+			// Preserve dynamic thinking suffix if present
+			thinkingSuffix := ""
+			if metadata != nil {
+				if _, hasThinking := metadata[util.ThinkingOriginalModelMetadataKey]; hasThinking {
+					if strings.HasPrefix(modelName, normalizedModel) {
+						thinkingSuffix = modelName[len(normalizedModel):]
+					}
+				}
+			}
+
+			// 检查映射目标是否已有思考后缀
+			mappedBaseModel, mappedThinkingMetadata := util.NormalizeThinkingModel(mappedModel)
+			if thinkingSuffix != "" && mappedThinkingMetadata == nil {
+				mappedModel = mappedModel + thinkingSuffix
+			}
+
+			// 获取映射后模型的 provider
+			mappedNormalized, mappedMeta := normalizeModelMetadata(mappedModel)
+			mappedProviders := util.GetProviderName(mappedNormalized)
+			if len(mappedProviders) == 0 {
+				mappedProviders = util.GetProviderName(mappedBaseModel)
+			}
+
+			if len(mappedProviders) > 0 {
+				// 映射成功，更新返回值
+				providers = mappedProviders
+				normalizedModel = mappedNormalized
+				if mappedMeta != nil {
+					metadata = mappedMeta
+				}
+				// 输出映射到的模型名
+				if mappedModelOut != nil {
+					*mappedModelOut = mappedModel
 				}
 			}
 		}

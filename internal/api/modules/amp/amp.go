@@ -126,6 +126,11 @@ func (m *AmpModule) Register(ctx modules.Context) error {
 		// Initialize model mapper from config (for routing unavailable models to alternatives)
 		m.modelMapper = NewModelMapper(settings.ModelMappings)
 
+		// Set model mapper to BaseHandler for global model mapping support on /v1/messages
+		if ctx.BaseHandler != nil {
+			ctx.BaseHandler.ModelMapper = m.modelMapper
+		}
+
 		// Store initial config for partial reload comparison
 		settingsCopy := settings
 		m.lastConfig = &settingsCopy
