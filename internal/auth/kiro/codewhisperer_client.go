@@ -33,6 +33,19 @@ type UsageLimitsResponse struct {
 	UserInfo           *UserInfo           `json:"userInfo,omitempty"`
 	SubscriptionInfo   *SubscriptionInfo   `json:"subscriptionInfo,omitempty"`
 	UsageBreakdownList []UsageBreakdown    `json:"usageBreakdownList,omitempty"`
+	Bonuses            []BonusInfo         `json:"bonuses,omitempty"`
+}
+
+// BonusInfo contains bonus credits information.
+type BonusInfo struct {
+	BonusID                   string   `json:"bonusId,omitempty"`
+	DisplayName               string   `json:"displayName,omitempty"`
+	CurrentUsageWithPrecision *float64 `json:"currentUsageWithPrecision,omitempty"`
+	UsageLimitWithPrecision   *float64 `json:"usageLimitWithPrecision,omitempty"`
+	CurrentUsage              *int     `json:"currentUsage,omitempty"`
+	UsageLimit                *int     `json:"usageLimit,omitempty"`
+	DaysUntilExpiry           *int     `json:"daysUntilExpiry,omitempty"`
+	ExpiryDate                *float64 `json:"expiryDate,omitempty"`
 }
 
 // UserInfo contains user information from the API.
@@ -47,15 +60,27 @@ type SubscriptionInfo struct {
 	Type              string `json:"type,omitempty"`
 }
 
+// FreeTrialInfo contains free trial/bonus credits information.
+type FreeTrialInfo struct {
+	CurrentUsage              *int     `json:"currentUsage,omitempty"`
+	CurrentUsageWithPrecision *float64 `json:"currentUsageWithPrecision,omitempty"`
+	UsageLimit                *int     `json:"usageLimit,omitempty"`
+	UsageLimitWithPrecision   *float64 `json:"usageLimitWithPrecision,omitempty"`
+	FreeTrialExpiry           *float64 `json:"freeTrialExpiry,omitempty"`
+	FreeTrialStatus           string   `json:"freeTrialStatus,omitempty"`
+}
+
 // UsageBreakdown contains usage details.
 type UsageBreakdown struct {
-	UsageLimit                 *int     `json:"usageLimit,omitempty"`
-	CurrentUsage               *int     `json:"currentUsage,omitempty"`
-	UsageLimitWithPrecision    *float64 `json:"usageLimitWithPrecision,omitempty"`
-	CurrentUsageWithPrecision  *float64 `json:"currentUsageWithPrecision,omitempty"`
-	NextDateReset              *float64 `json:"nextDateReset,omitempty"`
-	DisplayName                string   `json:"displayName,omitempty"`
-	ResourceType               string   `json:"resourceType,omitempty"`
+	UsageLimit                 *int           `json:"usageLimit,omitempty"`
+	CurrentUsage               *int           `json:"currentUsage,omitempty"`
+	UsageLimitWithPrecision    *float64       `json:"usageLimitWithPrecision,omitempty"`
+	CurrentUsageWithPrecision  *float64       `json:"currentUsageWithPrecision,omitempty"`
+	NextDateReset              *float64       `json:"nextDateReset,omitempty"`
+	DisplayName                string         `json:"displayName,omitempty"`
+	ResourceType               string         `json:"resourceType,omitempty"`
+	FreeTrialInfo              *FreeTrialInfo `json:"freeTrialInfo,omitempty"`
+	Bonuses                    []BonusInfo    `json:"bonuses,omitempty"`
 }
 
 // NewCodeWhispererClient creates a new CodeWhisperer client.

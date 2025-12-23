@@ -2,6 +2,9 @@ FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
+# 配置国内 Go 代理
+ENV GOPROXY=https://goproxy.cn,https://goproxy.io,direct
+
 COPY go.mod go.sum ./
 
 RUN go mod download

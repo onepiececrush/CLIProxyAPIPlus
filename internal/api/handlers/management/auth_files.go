@@ -2567,3 +2567,168 @@ func generateKiroPKCE() (verifier, challenge string, err error) {
 
 	return verifier, challenge, nil
 }
+
+// GetKiroUsageLimits returns usage limits for a specific Kiro auth file
+func (h *Handler) GetKiroUsageLimits(c *gin.Context) {
+	ctx := context.Background()
+
+	authID := c.Query("auth_id")
+	if authID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "auth_id is required"})
+		return
+	}
+
+	// Find the auth file
+	authFilePath := filepath.Join(h.cfg.AuthDir, authID)
+	data, err := os.ReadFile(authFilePath)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "auth file not found"})
+		return
+	}
+
+	var metadata map[string]any
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid auth file"})
+		return
+	}
+
+	// Extract access token (support both camelCase and snake_case field names)
+	accessToken := getStringFromMapMulti(metadata, "accessToken", "access_token")
+	if accessToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "access token not found in auth file"})
+		return
+	}
+
+	// Use CodeWhispererClient which doesn't require profileArn
+	cwClient := kiroauth.NewCodeWhispererClient(h.cfg, "")
+	usageLimits, err := cwClient.GetUsageLimits(ctx, accessToken)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+
+	// Convert to simplified response format
+	response := gin.H{
+		"subscriptionTitle": "",
+		"currentUsage":      0.0,
+		"usageLimit":        0.0,
+		"nextReset":         "",
+		"daysUntilReset":    0,
+	}
+
+	if usageLimits.SubscriptionInfo != nil {
+		response["subscriptionTitle"] = usageLimits.SubscriptionInfo.SubscriptionTitle
+	}
+
+	if len(usageLimits.UsageBreakdownList) > 0 {
+		breakdown := usageLimits.UsageBreakdownList[0]
+		if breakdown.CurrentUsageWithPrecision != nil {
+			response["currentUsage"] = *breakdown.CurrentUsageWithPrecision
+		} else if breakdown.CurrentUsage != nil {
+			response["currentUsage"] = float64(*breakdown.CurrentUsage)
+		}
+		if breakdown.UsageLimitWithPrecision != nil {
+			response["usageLimit"] = *breakdown.UsageLimitWithPrecision
+		} else if breakdown.UsageLimit != nil {
+			response["usageLimit"] = float64(*breakdown.UsageLimit)
+		}
+	}
+
+	if usageLimits.NextDateReset != nil {
+		// NextDateReset is Unix timestamp in milliseconds
+		response["nextReset"] = fmt.Sprintf("%.0f", *usageLimits.NextDateReset)
+	}
+
+	if usageLimits.DaysUntilReset != nil {
+		response["daysUntilReset"] = *usageLimits.DaysUntilReset
+	}
+
+	// Add bonuses information from freeTrialInfo (Bonus Credits)
+	bonusList := make([]gin.H, 0)
+
+	// Check freeTrialInfo in usageBreakdownList
+	if len(usageLimits.UsageBreakdownList) > 0 {
+		breakdown := usageLimits.UsageBreakdownList[0]
+		if breakdown.FreeTrialInfo != nil && breakdown.FreeTrialInfo.FreeTrialStatus == "ACTIVE" {
+			bonusItem := gin.H{
+				"displayName":     "Bonus Credits",
+				"currentUsage":    0.0,
+				"usageLimit":      0.0,
+				"daysUntilExpiry": 0,
+			}
+			if breakdown.FreeTrialInfo.CurrentUsageWithPrecision != nil {
+				bonusItem["currentUsage"] = *breakdown.FreeTrialInfo.CurrentUsageWithPrecision
+			} else if breakdown.FreeTrialInfo.CurrentUsage != nil {
+				bonusItem["currentUsage"] = float64(*breakdown.FreeTrialInfo.CurrentUsage)
+			}
+			if breakdown.FreeTrialInfo.UsageLimitWithPrecision != nil {
+				bonusItem["usageLimit"] = *breakdown.FreeTrialInfo.UsageLimitWithPrecision
+			} else if breakdown.FreeTrialInfo.UsageLimit != nil {
+				bonusItem["usageLimit"] = float64(*breakdown.FreeTrialInfo.UsageLimit)
+			}
+			// 计算剩余天数
+			if breakdown.FreeTrialInfo.FreeTrialExpiry != nil {
+				expiryTime := time.Unix(int64(*breakdown.FreeTrialInfo.FreeTrialExpiry), 0)
+				daysUntilExpiry := int(time.Until(expiryTime).Hours() / 24)
+				if daysUntilExpiry < 0 {
+					daysUntilExpiry = 0
+				}
+				bonusItem["daysUntilExpiry"] = daysUntilExpiry
+				bonusItem["expiryDate"] = fmt.Sprintf("%.0f", *breakdown.FreeTrialInfo.FreeTrialExpiry*1000)
+			}
+			bonusList = append(bonusList, bonusItem)
+		}
+
+		// Also check bonuses array in breakdown
+		for _, bonus := range breakdown.Bonuses {
+			bonusItem := gin.H{
+				"displayName":     bonus.DisplayName,
+				"currentUsage":    0.0,
+				"usageLimit":      0.0,
+				"daysUntilExpiry": 0,
+			}
+			if bonus.CurrentUsageWithPrecision != nil {
+				bonusItem["currentUsage"] = *bonus.CurrentUsageWithPrecision
+			} else if bonus.CurrentUsage != nil {
+				bonusItem["currentUsage"] = float64(*bonus.CurrentUsage)
+			}
+			if bonus.UsageLimitWithPrecision != nil {
+				bonusItem["usageLimit"] = *bonus.UsageLimitWithPrecision
+			} else if bonus.UsageLimit != nil {
+				bonusItem["usageLimit"] = float64(*bonus.UsageLimit)
+			}
+			if bonus.DaysUntilExpiry != nil {
+				bonusItem["daysUntilExpiry"] = *bonus.DaysUntilExpiry
+			}
+			if bonus.ExpiryDate != nil {
+				bonusItem["expiryDate"] = fmt.Sprintf("%.0f", *bonus.ExpiryDate)
+			}
+			bonusList = append(bonusList, bonusItem)
+		}
+	}
+
+	if len(bonusList) > 0 {
+		response["bonuses"] = bonusList
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"usage":  response,
+	})
+}
+
+func getStringFromMap(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func getStringFromMapMulti(m map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if v, ok := m[key].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
