@@ -74,6 +74,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	body = applyPayloadConfig(e.cfg, req.Model, body)
 
+	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
+	body = disableThinkingIfToolChoiceForced(body)
+
 	// Ensure max_tokens > thinking.budget_tokens when thinking is enabled
 	body = ensureMaxTokensForThinking(req.Model, body)
 
@@ -184,6 +187,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = e.injectThinkingConfig(req.Model, req.Metadata, body)
 	body = checkSystemInstructions(body)
 	body = applyPayloadConfig(e.cfg, req.Model, body)
+
+	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
+	body = disableThinkingIfToolChoiceForced(body)
 
 	// Ensure max_tokens > thinking.budget_tokens when thinking is enabled
 	body = ensureMaxTokensForThinking(req.Model, body)
@@ -461,6 +467,19 @@ func (e *ClaudeExecutor) injectThinkingConfig(modelName string, metadata map[str
 	return util.ApplyClaudeThinkingConfig(body, budget)
 }
 
+// disableThinkingIfToolChoiceForced checks if tool_choice forces tool use and disables thinking.
+// Anthropic API does not allow thinking when tool_choice is set to "any" or a specific tool.
+// See: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#important-considerations
+func disableThinkingIfToolChoiceForced(body []byte) []byte {
+	toolChoiceType := gjson.GetBytes(body, "tool_choice.type").String()
+	// "auto" is allowed with thinking, but "any" or "tool" (specific tool) are not
+	if toolChoiceType == "any" || toolChoiceType == "tool" {
+		// Remove thinking configuration entirely to avoid API error
+		body, _ = sjson.DeleteBytes(body, "thinking")
+	}
+	return body
+}
+
 // ensureMaxTokensForThinking ensures max_tokens > thinking.budget_tokens when thinking is enabled.
 // Anthropic API requires this constraint; violating it returns a 400 error.
 // This function should be called after all thinking configuration is finalized.
@@ -662,7 +681,14 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 }
 
 func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string) {
-	r.Header.Set("Authorization", "Bearer "+apiKey)
+	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
+	isAnthropicBase := r.URL != nil && strings.EqualFold(r.URL.Scheme, "https") && strings.EqualFold(r.URL.Host, "api.anthropic.com")
+	if isAnthropicBase && useAPIKey {
+		r.Header.Del("Authorization")
+		r.Header.Set("x-api-key", apiKey)
+	} else {
+		r.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 	r.Header.Set("Content-Type", "application/json")
 
 	var ginHeaders http.Header
