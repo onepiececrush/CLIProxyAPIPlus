@@ -157,11 +157,14 @@ type RoutingConfig struct {
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 }
 
-// ModelNameMapping defines a model ID rename mapping for a specific channel.
-// It maps the original model name (Name) to the client-visible alias (Alias).
+// ModelNameMapping defines a model ID mapping for a specific channel.
+// It maps the upstream model name (Name) to the client-visible alias (Alias).
+// When Fork is true, the alias is added as an additional model in listings while
+// keeping the original model ID available.
 type ModelNameMapping struct {
 	Name  string `yaml:"name" json:"name"`
 	Alias string `yaml:"alias" json:"alias"`
+	Fork  bool   `yaml:"fork,omitempty" json:"fork,omitempty"`
 }
 
 // AmpModelMapping defines a model name mapping for Amp CLI requests.
@@ -280,6 +283,9 @@ type ClaudeModel struct {
 	Alias string `yaml:"alias" json:"alias"`
 }
 
+func (m ClaudeModel) GetName() string  { return m.Name }
+func (m ClaudeModel) GetAlias() string { return m.Alias }
+
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
@@ -315,6 +321,9 @@ type CodexModel struct {
 	Alias string `yaml:"alias" json:"alias"`
 }
 
+func (m CodexModel) GetName() string  { return m.Name }
+func (m CodexModel) GetAlias() string { return m.Alias }
+
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
@@ -330,12 +339,27 @@ type GeminiKey struct {
 	// ProxyURL optionally overrides the global proxy for this API key.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 
+	// Models defines upstream model names and aliases for request routing.
+	Models []GeminiModel `yaml:"models,omitempty" json:"models,omitempty"`
+
 	// Headers optionally adds extra HTTP headers for requests sent with this key.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 
 	// ExcludedModels lists model IDs that should be excluded for this provider.
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
 }
+
+// GeminiModel describes a mapping between an alias and the actual upstream model name.
+type GeminiModel struct {
+	// Name is the upstream model identifier used when issuing requests.
+	Name string `yaml:"name" json:"name"`
+
+	// Alias is the client-facing model name that maps to Name.
+	Alias string `yaml:"alias" json:"alias"`
+}
+
+func (m GeminiModel) GetName() string  { return m.Name }
+func (m GeminiModel) GetAlias() string { return m.Alias }
 
 // KiroKey represents the configuration for Kiro (AWS CodeWhisperer) authentication.
 type KiroKey struct {
@@ -575,7 +599,7 @@ func (cfg *Config) SanitizeOAuthModelMappings() {
 			}
 			seenName[nameKey] = struct{}{}
 			seenAlias[aliasKey] = struct{}{}
-			clean = append(clean, ModelNameMapping{Name: name, Alias: alias})
+			clean = append(clean, ModelNameMapping{Name: name, Alias: alias, Fork: mapping.Fork})
 		}
 		if len(clean) > 0 {
 			out[channel] = clean
