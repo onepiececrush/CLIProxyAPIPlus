@@ -22,41 +22,39 @@ func NewFileSynthesizer() *FileSynthesizer {
 }
 
 // Synthesize generates Auth entries from auth files in the auth directory.
+// It recursively scans subdirectories to find all JSON auth files.
 func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	out := make([]*coreauth.Auth, 0, 16)
 	if ctx == nil || ctx.AuthDir == "" {
 		return out, nil
 	}
 
-	entries, err := os.ReadDir(ctx.AuthDir)
-	if err != nil {
-		// Not an error if directory doesn't exist
-		return out, nil
-	}
-
 	now := ctx.Now
 	cfg := ctx.Config
 
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	// Use WalkDir to recursively scan all subdirectories
+	err := filepath.WalkDir(ctx.AuthDir, func(full string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // Skip files/dirs we can't access
 		}
-		name := e.Name()
+		if d.IsDir() {
+			return nil // Continue into subdirectories
+		}
+		name := d.Name()
 		if !strings.HasSuffix(strings.ToLower(name), ".json") {
-			continue
+			return nil
 		}
-		full := filepath.Join(ctx.AuthDir, name)
 		data, errRead := os.ReadFile(full)
 		if errRead != nil || len(data) == 0 {
-			continue
+			return nil
 		}
 		var metadata map[string]any
 		if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
-			continue
+			return nil
 		}
 		t, _ := metadata["type"].(string)
 		if t == "" {
-			continue
+			return nil
 		}
 		provider := strings.ToLower(t)
 		if provider == "gemini" {
@@ -109,11 +107,18 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 				}
 				out = append(out, a)
 				out = append(out, virtuals...)
-				continue
+				return nil
 			}
 		}
 		out = append(out, a)
+		return nil
+	})
+
+	if err != nil {
+		// Not an error if directory doesn't exist or can't be walked
+		return out, nil
 	}
+
 	return out, nil
 }
 

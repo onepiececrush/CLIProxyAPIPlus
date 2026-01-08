@@ -1,13 +1,20 @@
 FROM golang:1.24-alpine AS builder
 
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV http_proxy=${HTTP_PROXY} https_proxy=${HTTPS_PROXY}
+
 WORKDIR /app
 
-# 配置国内 Go 代理
-ENV GOPROXY=https://goproxy.cn,https://goproxy.io,direct
+# 使用阿里云 Go 代理
+ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,direct
 
 COPY go.mod go.sum ./
 
 RUN go mod download
+
+# 清除代理设置
+ENV http_proxy= https_proxy=
 
 COPY . .
 
