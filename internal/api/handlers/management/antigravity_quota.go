@@ -1,14 +1,11 @@
 package management
 
 import (
-	"context"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 )
 
 // GetAntigravityQuotas returns quota information for Antigravity auth files
@@ -18,7 +15,6 @@ func (h *Handler) GetAntigravityQuotas(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
 	auths := h.authManager.List()
 
 	result := make(map[string]interface{})
@@ -35,12 +31,14 @@ func (h *Handler) GetAntigravityQuotas(c *gin.Context) {
 		}
 
 		// Create executor and fetch quotas
-		exec := executor.NewAntigravityExecutor(h.cfg)
-		quotas, err := exec.GetQuotas(ctx, auth)
-		if err != nil {
-			log.WithError(err).Warnf("failed to get quotas for auth %s", auth.ID)
-			continue
-		}
+		// TODO: Re-enable GetQuotas after upstream merge is complete
+		// exec := executor.NewAntigravityExecutor(h.cfg)
+		// quotas, err := exec.GetQuotas(ctx, auth)
+		// if err != nil {
+		// 	log.WithError(err).Warnf("failed to get quotas for auth %s", auth.ID)
+		// 	continue
+		// }
+		quotas := make(map[string]interface{}) // Temporary placeholder
 
 		// Store quotas with auth file name as key
 		fileName := auth.FileName

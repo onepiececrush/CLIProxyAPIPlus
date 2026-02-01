@@ -127,9 +127,10 @@ func (m *AmpModule) Register(ctx modules.Context) error {
 		m.modelMapper = NewModelMapper(settings.ModelMappings)
 
 		// Set model mapper to BaseHandler for global model mapping support on /v1/messages
-		if ctx.BaseHandler != nil {
-			ctx.BaseHandler.ModelMapper = m.modelMapper
-		}
+		// TODO: Re-enable after upstream merge is complete
+		// if ctx.BaseHandler != nil {
+		// 	ctx.BaseHandler.ModelMapper = m.modelMapper
+		// }
 
 		// Store initial config for partial reload comparison
 		settingsCopy := settings
