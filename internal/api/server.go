@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
@@ -58,9 +60,9 @@ type ServerOption func(*serverOptionConfig)
 func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.RequestLogger {
 	configDir := filepath.Dir(configPath)
 	if base := util.WritablePath(); base != "" {
-		return logging.NewFileRequestLogger(cfg.RequestLog, filepath.Join(base, "logs"), configDir)
+		return logging.NewFileRequestLogger(cfg.RequestLog, filepath.Join(base, "logs"), configDir, cfg.ErrorLogsMaxFiles)
 	}
-	return logging.NewFileRequestLogger(cfg.RequestLog, "logs", configDir)
+	return logging.NewFileRequestLogger(cfg.RequestLog, "logs", configDir, cfg.ErrorLogsMaxFiles)
 }
 
 // WithMiddleware appends additional Gin middleware during server construction.
@@ -259,10 +261,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
-	logDir := filepath.Join(s.currentPath, "logs")
-	if base := util.WritablePath(); base != "" {
-		logDir = filepath.Join(base, "logs")
-	}
+	logDir := logging.ResolveLogDirectory(cfg)
 	s.mgmt.SetLogDirectory(logDir)
 	s.localPassword = optionState.localPassword
 
@@ -292,6 +291,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if hasManagementSecret {
 		s.registerManagementRoutes()
 	}
+
+	// === CLIProxyAPIPlus 扩展: 注册 Kiro OAuth Web 路由 ===
+	kiroOAuthHandler := kiro.NewOAuthWebHandler(cfg)
+	kiroOAuthHandler.RegisterRoutes(engine)
+	log.Info("Kiro OAuth Web routes registered at /v0/oauth/kiro/*")
 
 	if optionState.keepAliveEnabled {
 		s.enableKeepAlive(optionState.keepAliveTimeout, optionState.keepAliveOnTimeout)
@@ -326,6 +330,7 @@ func (s *Server) setupRoutes() {
 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
+		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
 
 	// Gemini compatible API routes
@@ -516,6 +521,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
 		mgmt.PATCH("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
 
+		mgmt.GET("/error-logs-max-files", s.mgmt.GetErrorLogsMaxFiles)
+		mgmt.PUT("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
+		mgmt.PATCH("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
+
 		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
 		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
 		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
@@ -621,18 +630,20 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/oauth-excluded-models", s.mgmt.PatchOAuthExcludedModels)
 		mgmt.DELETE("/oauth-excluded-models", s.mgmt.DeleteOAuthExcludedModels)
 
-		mgmt.GET("/oauth-model-mappings", s.mgmt.GetOAuthModelMappings)
-		mgmt.PUT("/oauth-model-mappings", s.mgmt.PutOAuthModelMappings)
-		mgmt.PATCH("/oauth-model-mappings", s.mgmt.PatchOAuthModelMappings)
-		mgmt.DELETE("/oauth-model-mappings", s.mgmt.DeleteOAuthModelMappings)
+		mgmt.GET("/oauth-model-alias", s.mgmt.GetOAuthModelAlias)
+		mgmt.PUT("/oauth-model-alias", s.mgmt.PutOAuthModelAlias)
+		mgmt.PATCH("/oauth-model-alias", s.mgmt.PatchOAuthModelAlias)
+		mgmt.DELETE("/oauth-model-alias", s.mgmt.DeleteOAuthModelAlias)
 
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
+		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
 		mgmt.GET("/antigravity-quotas", s.mgmt.GetAntigravityQuotas)
 		mgmt.GET("/kiro-usage-limits", s.mgmt.GetKiroUsageLimits)
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
+		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
@@ -643,6 +654,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/iflow-auth-url", s.mgmt.RequestIFlowToken)
 		mgmt.POST("/iflow-auth-url", s.mgmt.RequestIFlowCookieToken)
 		mgmt.GET("/kiro-auth-url", s.mgmt.RequestKiroToken)
+		mgmt.GET("/github-auth-url", s.mgmt.RequestGitHubToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 	}
@@ -894,47 +906,28 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		} else if toggler, ok := s.requestLogger.(interface{ SetEnabled(bool) }); ok {
 			toggler.SetEnabled(cfg.RequestLog)
 		}
-		if oldCfg != nil {
-			log.Debugf("request logging updated from %t to %t", previousRequestLog, cfg.RequestLog)
-		} else {
-			log.Debugf("request logging toggled to %t", cfg.RequestLog)
-		}
 	}
 
 	if oldCfg == nil || oldCfg.LoggingToFile != cfg.LoggingToFile || oldCfg.LogsMaxTotalSizeMB != cfg.LogsMaxTotalSizeMB {
 		if err := logging.ConfigureLogOutput(cfg); err != nil {
 			log.Errorf("failed to reconfigure log output: %v", err)
-		} else {
-			if oldCfg == nil {
-				log.Debug("log output configuration refreshed")
-			} else {
-				if oldCfg.LoggingToFile != cfg.LoggingToFile {
-					log.Debugf("logging_to_file updated from %t to %t", oldCfg.LoggingToFile, cfg.LoggingToFile)
-				}
-				if oldCfg.LogsMaxTotalSizeMB != cfg.LogsMaxTotalSizeMB {
-					log.Debugf("logs_max_total_size_mb updated from %d to %d", oldCfg.LogsMaxTotalSizeMB, cfg.LogsMaxTotalSizeMB)
-				}
-			}
 		}
 	}
 
 	if oldCfg == nil || oldCfg.UsageStatisticsEnabled != cfg.UsageStatisticsEnabled {
 		usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
-		if oldCfg != nil {
-			log.Debugf("usage_statistics_enabled updated from %t to %t", oldCfg.UsageStatisticsEnabled, cfg.UsageStatisticsEnabled)
-		} else {
-			log.Debugf("usage_statistics_enabled toggled to %t", cfg.UsageStatisticsEnabled)
+	}
+
+	if s.requestLogger != nil && (oldCfg == nil || oldCfg.ErrorLogsMaxFiles != cfg.ErrorLogsMaxFiles) {
+		if setter, ok := s.requestLogger.(interface{ SetErrorLogsMaxFiles(int) }); ok {
+			setter.SetErrorLogsMaxFiles(cfg.ErrorLogsMaxFiles)
 		}
 	}
 
 	if oldCfg == nil || oldCfg.DisableCooling != cfg.DisableCooling {
 		auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
-		if oldCfg != nil {
-			log.Debugf("disable_cooling updated from %t to %t", oldCfg.DisableCooling, cfg.DisableCooling)
-		} else {
-			log.Debugf("disable_cooling toggled to %t", cfg.DisableCooling)
-		}
 	}
+
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second)
 	}
@@ -942,11 +935,6 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	// Update log level dynamically when debug flag changes
 	if oldCfg == nil || oldCfg.Debug != cfg.Debug {
 		util.SetLogLevel(cfg)
-		if oldCfg != nil {
-			log.Debugf("debug mode updated from %t to %t", oldCfg.Debug, cfg.Debug)
-		} else {
-			log.Debugf("debug mode toggled to %t", cfg.Debug)
-		}
 	}
 
 	prevSecretEmpty := true
@@ -1002,14 +990,17 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
 	}
 
-	// Notify Amp module of config changes (for model mapping hot-reload)
-	if s.ampModule != nil {
-		log.Debugf("triggering amp module config update")
-		if err := s.ampModule.OnConfigUpdated(cfg); err != nil {
-			log.Errorf("failed to update Amp module config: %v", err)
+	// Notify Amp module only when Amp config has changed.
+	ampConfigChanged := oldCfg == nil || !reflect.DeepEqual(oldCfg.AmpCode, cfg.AmpCode)
+	if ampConfigChanged {
+		if s.ampModule != nil {
+			log.Debugf("triggering amp module config update")
+			if err := s.ampModule.OnConfigUpdated(cfg); err != nil {
+				log.Errorf("failed to update Amp module config: %v", err)
+			}
+		} else {
+			log.Warnf("amp module is nil, skipping config update")
 		}
-	} else {
-		log.Warnf("amp module is nil, skipping config update")
 	}
 
 	// Count client sources from configuration and auth store.

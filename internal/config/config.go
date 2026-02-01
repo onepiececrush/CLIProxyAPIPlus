@@ -6,12 +6,14 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"syscall"
 
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 )
@@ -48,6 +50,10 @@ type Config struct {
 	// LogsMaxTotalSizeMB limits the total size (in MB) of log files under the logs directory.
 	// When exceeded, the oldest log files are deleted until within the limit. Set to 0 to disable.
 	LogsMaxTotalSizeMB int `yaml:"logs-max-total-size-mb" json:"logs-max-total-size-mb"`
+
+	// ErrorLogsMaxFiles limits the number of error log files retained when request logging is disabled.
+	// When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
+	ErrorLogsMaxFiles int `yaml:"error-logs-max-files" json:"error-logs-max-files"`
 
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
@@ -96,15 +102,16 @@ type Config struct {
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
 
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
+	// Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow, kiro, github-copilot.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
-	// OAuthModelMappings defines global model name mappings for OAuth/file-backed auth channels.
-	// These mappings affect both model listing and model routing for supported channels:
-	// gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow.
+	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
+	// These aliases affect both model listing and model routing for supported channels:
+	// gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow, kiro, github-copilot.
 	//
 	// NOTE: This does not apply to existing per-credential model alias features under:
 	// gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, and ampcode.
-	OAuthModelMappings map[string][]ModelNameMapping `yaml:"oauth-model-mappings,omitempty" json:"oauth-model-mappings,omitempty"`
+	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
@@ -157,11 +164,11 @@ type RoutingConfig struct {
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 }
 
-// ModelNameMapping defines a model ID mapping for a specific channel.
+// OAuthModelAlias defines a model ID alias for a specific channel.
 // It maps the upstream model name (Name) to the client-visible alias (Alias).
 // When Fork is true, the alias is added as an additional model in listings while
 // keeping the original model ID available.
-type ModelNameMapping struct {
+type OAuthModelAlias struct {
 	Name  string `yaml:"name" json:"name"`
 	Alias string `yaml:"alias" json:"alias"`
 	Fork  bool   `yaml:"fork,omitempty" json:"fork,omitempty"`
@@ -228,8 +235,22 @@ type AmpUpstreamAPIKeyEntry struct {
 type PayloadConfig struct {
 	// Default defines rules that only set parameters when they are missing in the payload.
 	Default []PayloadRule `yaml:"default" json:"default"`
+	// DefaultRaw defines rules that set raw JSON values only when they are missing.
+	DefaultRaw []PayloadRule `yaml:"default-raw" json:"default-raw"`
 	// Override defines rules that always set parameters, overwriting any existing values.
 	Override []PayloadRule `yaml:"override" json:"override"`
+	// OverrideRaw defines rules that always set raw JSON values, overwriting any existing values.
+	OverrideRaw []PayloadRule `yaml:"override-raw" json:"override-raw"`
+	// Filter defines rules that remove parameters from the payload by JSON path.
+	Filter []PayloadFilterRule `yaml:"filter" json:"filter"`
+}
+
+// PayloadFilterRule describes a rule to remove specific JSON paths from matching model payloads.
+type PayloadFilterRule struct {
+	// Models lists model entries with name pattern and protocol constraint.
+	Models []PayloadModelRule `yaml:"models" json:"models"`
+	// Params lists JSON paths (gjson/sjson syntax) to remove from the payload.
+	Params []string `yaml:"params" json:"params"`
 }
 
 // PayloadRule describes a single rule targeting a list of models with parameter updates.
@@ -237,6 +258,7 @@ type PayloadRule struct {
 	// Models lists model entries with name pattern and protocol constraint.
 	Models []PayloadModelRule `yaml:"models" json:"models"`
 	// Params maps JSON paths (gjson/sjson syntax) to values written into the payload.
+	// For *-raw rules, values are treated as raw JSON fragments (strings are used as-is).
 	Params map[string]any `yaml:"params" json:"params"`
 }
 
@@ -248,11 +270,34 @@ type PayloadModelRule struct {
 	Protocol string `yaml:"protocol" json:"protocol"`
 }
 
+// CloakConfig configures request cloaking for non-Claude-Code clients.
+// Cloaking disguises API requests to appear as originating from the official Claude Code CLI.
+type CloakConfig struct {
+	// Mode controls cloaking behavior: "auto" (default), "always", or "never".
+	// - "auto": cloak only when client is not Claude Code (based on User-Agent)
+	// - "always": always apply cloaking regardless of client
+	// - "never": never apply cloaking
+	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
+
+	// StrictMode controls how system prompts are handled when cloaking.
+	// - false (default): prepend Claude Code prompt to user system messages
+	// - true: strip all user system messages, keep only Claude Code prompt
+	StrictMode bool `yaml:"strict-mode,omitempty" json:"strict-mode,omitempty"`
+
+	// SensitiveWords is a list of words to obfuscate with zero-width characters.
+	// This can help bypass certain content filters.
+	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
+}
+
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
 	// APIKey is the authentication key for accessing Claude API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Priority controls selection preference when multiple credentials match.
+	// Higher values are preferred; defaults to 0.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/claude-sonnet-4").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
@@ -272,7 +317,13 @@ type ClaudeKey struct {
 
 	// ExcludedModels lists model IDs that should be excluded for this provider.
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+
+	// Cloak configures request cloaking for non-Claude-Code clients.
+	Cloak *CloakConfig `yaml:"cloak,omitempty" json:"cloak,omitempty"`
 }
+
+func (k ClaudeKey) GetAPIKey() string  { return k.APIKey }
+func (k ClaudeKey) GetBaseURL() string { return k.BaseURL }
 
 // ClaudeModel describes a mapping between an alias and the actual upstream model name.
 type ClaudeModel struct {
@@ -291,6 +342,10 @@ func (m ClaudeModel) GetAlias() string { return m.Alias }
 type CodexKey struct {
 	// APIKey is the authentication key for accessing Codex API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Priority controls selection preference when multiple credentials match.
+	// Higher values are preferred; defaults to 0.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/gpt-5-codex").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
@@ -312,6 +367,9 @@ type CodexKey struct {
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
 }
 
+func (k CodexKey) GetAPIKey() string  { return k.APIKey }
+func (k CodexKey) GetBaseURL() string { return k.BaseURL }
+
 // CodexModel describes a mapping between an alias and the actual upstream model name.
 type CodexModel struct {
 	// Name is the upstream model identifier used when issuing requests.
@@ -329,6 +387,10 @@ func (m CodexModel) GetAlias() string { return m.Alias }
 type GeminiKey struct {
 	// APIKey is the authentication key for accessing Gemini API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Priority controls selection preference when multiple credentials match.
+	// Higher values are preferred; defaults to 0.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/gemini-3-pro-preview").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
@@ -348,6 +410,9 @@ type GeminiKey struct {
 	// ExcludedModels lists model IDs that should be excluded for this provider.
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
 }
+
+func (k GeminiKey) GetAPIKey() string  { return k.APIKey }
+func (k GeminiKey) GetBaseURL() string { return k.BaseURL }
 
 // GeminiModel describes a mapping between an alias and the actual upstream model name.
 type GeminiModel struct {
@@ -396,6 +461,10 @@ type OpenAICompatibility struct {
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
 
+	// Priority controls selection preference when multiple providers or credentials match.
+	// Higher values are preferred; defaults to 0.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+
 	// Prefix optionally namespaces model aliases for this provider (e.g., "teamA/kimi-k2").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 
@@ -431,6 +500,9 @@ type OpenAICompatibilityModel struct {
 	Alias string `yaml:"alias" json:"alias"`
 }
 
+func (m OpenAICompatibilityModel) GetName() string  { return m.Name }
+func (m OpenAICompatibilityModel) GetAlias() string { return m.Alias }
+
 // LoadConfig reads a YAML configuration file from the given path,
 // unmarshals it into a Config struct, applies environment variable overrides,
 // and returns it.
@@ -449,6 +521,15 @@ func LoadConfig(configFile string) (*Config, error) {
 // If optional is true and the file is missing, it returns an empty Config.
 // If optional is true and the file is empty or invalid, it returns an empty Config.
 func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
+	// Perform oauth-model-alias migration before loading config.
+	// This migrates oauth-model-mappings to oauth-model-alias if needed.
+	if migrated, err := MigrateOAuthModelAlias(configFile); err != nil {
+		// Log warning but don't fail - config loading should still work
+		fmt.Printf("Warning: oauth-model-alias migration failed: %v\n", err)
+	} else if migrated {
+		fmt.Println("Migrated oauth-model-mappings to oauth-model-alias")
+	}
+
 	// Read the entire configuration file into memory.
 	data, err := os.ReadFile(configFile)
 	if err != nil {
@@ -472,6 +553,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
+	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = false
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
@@ -521,6 +603,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.LogsMaxTotalSizeMB = 0
 	}
 
+	if cfg.ErrorLogsMaxFiles < 0 {
+		cfg.ErrorLogsMaxFiles = 10
+	}
+
 	// Sync request authentication providers with inline API keys for backwards compatibility.
 	syncInlineAccessProvider(&cfg)
 
@@ -545,8 +631,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
-	// Normalize global OAuth model name mappings.
-	cfg.SanitizeOAuthModelMappings()
+	// Normalize global OAuth model name aliases.
+	cfg.SanitizeOAuthModelAlias()
+
+	// Validate raw payload rules and drop invalid entries.
+	cfg.SanitizePayloadRules()
 
 	if cfg.legacyMigrationPending {
 		fmt.Println("Detected legacy configuration keys, attempting to persist the normalized config...")
@@ -564,48 +653,97 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	return &cfg, nil
 }
 
-// SanitizeOAuthModelMappings normalizes and deduplicates global OAuth model name mappings.
-// It trims whitespace, normalizes channel keys to lower-case, drops empty entries,
-// and ensures (From, To) pairs are unique within each channel.
-func (cfg *Config) SanitizeOAuthModelMappings() {
-	if cfg == nil || len(cfg.OAuthModelMappings) == 0 {
+// SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.
+func (cfg *Config) SanitizePayloadRules() {
+	if cfg == nil {
 		return
 	}
-	out := make(map[string][]ModelNameMapping, len(cfg.OAuthModelMappings))
-	for rawChannel, mappings := range cfg.OAuthModelMappings {
-		channel := strings.ToLower(strings.TrimSpace(rawChannel))
-		if channel == "" || len(mappings) == 0 {
+	cfg.Payload.DefaultRaw = sanitizePayloadRawRules(cfg.Payload.DefaultRaw, "default-raw")
+	cfg.Payload.OverrideRaw = sanitizePayloadRawRules(cfg.Payload.OverrideRaw, "override-raw")
+}
+
+func sanitizePayloadRawRules(rules []PayloadRule, section string) []PayloadRule {
+	if len(rules) == 0 {
+		return rules
+	}
+	out := make([]PayloadRule, 0, len(rules))
+	for i := range rules {
+		rule := rules[i]
+		if len(rule.Params) == 0 {
 			continue
 		}
-		seenName := make(map[string]struct{}, len(mappings))
-		seenAlias := make(map[string]struct{}, len(mappings))
-		clean := make([]ModelNameMapping, 0, len(mappings))
-		for _, mapping := range mappings {
-			name := strings.TrimSpace(mapping.Name)
-			alias := strings.TrimSpace(mapping.Alias)
+		invalid := false
+		for path, value := range rule.Params {
+			raw, ok := payloadRawString(value)
+			if !ok {
+				continue
+			}
+			trimmed := bytes.TrimSpace(raw)
+			if len(trimmed) == 0 || !json.Valid(trimmed) {
+				log.WithFields(log.Fields{
+					"section":    section,
+					"rule_index": i + 1,
+					"param":      path,
+				}).Warn("payload rule dropped: invalid raw JSON")
+				invalid = true
+				break
+			}
+		}
+		if invalid {
+			continue
+		}
+		out = append(out, rule)
+	}
+	return out
+}
+
+func payloadRawString(value any) ([]byte, bool) {
+	switch typed := value.(type) {
+	case string:
+		return []byte(typed), true
+	case []byte:
+		return typed, true
+	default:
+		return nil, false
+	}
+}
+
+// SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
+// It trims whitespace, normalizes channel keys to lower-case, drops empty entries,
+// allows multiple aliases per upstream name, and ensures aliases are unique within each channel.
+func (cfg *Config) SanitizeOAuthModelAlias() {
+	if cfg == nil || len(cfg.OAuthModelAlias) == 0 {
+		return
+	}
+	out := make(map[string][]OAuthModelAlias, len(cfg.OAuthModelAlias))
+	for rawChannel, aliases := range cfg.OAuthModelAlias {
+		channel := strings.ToLower(strings.TrimSpace(rawChannel))
+		if channel == "" || len(aliases) == 0 {
+			continue
+		}
+		seenAlias := make(map[string]struct{}, len(aliases))
+		clean := make([]OAuthModelAlias, 0, len(aliases))
+		for _, entry := range aliases {
+			name := strings.TrimSpace(entry.Name)
+			alias := strings.TrimSpace(entry.Alias)
 			if name == "" || alias == "" {
 				continue
 			}
 			if strings.EqualFold(name, alias) {
 				continue
 			}
-			nameKey := strings.ToLower(name)
 			aliasKey := strings.ToLower(alias)
-			if _, ok := seenName[nameKey]; ok {
-				continue
-			}
 			if _, ok := seenAlias[aliasKey]; ok {
 				continue
 			}
-			seenName[nameKey] = struct{}{}
 			seenAlias[aliasKey] = struct{}{}
-			clean = append(clean, ModelNameMapping{Name: name, Alias: alias, Fork: mapping.Fork})
+			clean = append(clean, OAuthModelAlias{Name: name, Alias: alias, Fork: entry.Fork})
 		}
 		if len(clean) > 0 {
 			out[channel] = clean
 		}
 	}
-	cfg.OAuthModelMappings = out
+	cfg.OAuthModelAlias = out
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are
@@ -862,6 +1000,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	removeLegacyGenerativeLanguageKeys(original.Content[0])
 
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-excluded-models")
+	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
@@ -1352,6 +1491,16 @@ func pruneMappingToGeneratedKeys(dstRoot, srcRoot *yaml.Node, key string) {
 	}
 	srcIdx := findMapKeyIndex(srcRoot, key)
 	if srcIdx < 0 {
+		// Keep an explicit empty mapping for oauth-model-alias when it was previously present.
+		//
+		// Rationale: LoadConfig runs MigrateOAuthModelAlias before unmarshalling. If the
+		// oauth-model-alias key is missing, migration will add the default antigravity aliases.
+		// When users delete the last channel from oauth-model-alias via the management API,
+		// we want that deletion to persist across hot reloads and restarts.
+		if key == "oauth-model-alias" {
+			dstRoot.Content[dstIdx+1] = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			return
+		}
 		removeMapKey(dstRoot, key)
 		return
 	}

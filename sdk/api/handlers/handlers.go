@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -49,15 +51,6 @@ const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
 )
-
-// ModelMapper provides model name mapping/aliasing for API requests.
-// When a request comes in for a model that isn't available locally,
-// this mapper can redirect it to an alternative model that IS available.
-type ModelMapper interface {
-	// MapModel returns the target model name if a mapping exists and the target
-	// model has available providers. Returns empty string if no mapping applies.
-	MapModel(requestedModel string) string
-}
 
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
 // If errText is already valid JSON, it is returned as-is to preserve upstream error payloads.
@@ -122,6 +115,19 @@ func StreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// NonStreamingKeepAliveInterval returns the keep-alive interval for non-streaming responses.
+// Returning 0 disables keep-alives (default when unset).
+func NonStreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
+	seconds := 0
+	if cfg != nil {
+		seconds = cfg.NonStreamKeepAliveInterval
+	}
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 // StreamingBootstrapRetries returns how many times a streaming request may be retried before any bytes are sent.
 func StreamingBootstrapRetries(cfg *config.SDKConfig) int {
 	retries := defaultStreamingBootstrapRetries
@@ -172,10 +178,6 @@ type BaseAPIHandler struct {
 
 	// Cfg holds the current application configuration.
 	Cfg *config.SDKConfig
-
-	// ModelMapper provides global model name mapping for all API endpoints.
-	// When a requested model has no provider, the mapper can redirect to an available model.
-	ModelMapper ModelMapper
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -307,10 +309,62 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 }
 
+// StartNonStreamingKeepAlive emits blank lines every 5 seconds while waiting for a non-streaming response.
+// It returns a stop function that must be called before writing the final response.
+func (h *BaseAPIHandler) StartNonStreamingKeepAlive(c *gin.Context, ctx context.Context) func() {
+	if h == nil || c == nil {
+		return func() {}
+	}
+	interval := NonStreamingKeepAliveInterval(h.Cfg)
+	if interval <= 0 {
+		return func() {}
+	}
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		return func() {}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	stopChan := make(chan struct{})
+	var stopOnce sync.Once
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopChan:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _ = c.Writer.Write([]byte("\n"))
+				flusher.Flush()
+			}
+		}
+	}()
+
+	return func() {
+		stopOnce.Do(func() {
+			close(stopChan)
+		})
+		wg.Wait()
+	}
+}
+
 // appendAPIResponse preserves any previously captured API response and appends new data.
 func appendAPIResponse(c *gin.Context, data []byte) {
 	if c == nil || len(data) == 0 {
 		return
+	}
+
+	// Capture timestamp on first API response
+	if _, exists := c.Get("API_RESPONSE_TIMESTAMP"); !exists {
+		c.Set("API_RESPONSE_TIMESTAMP", time.Now())
 	}
 
 	if existing, exists := c.Get("API_RESPONSE"); exists {
@@ -332,17 +386,15 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
-	providers, normalizedModel, metadata, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	req := coreexecutor.Request{
 		Model:   normalizedModel,
 		Payload: cloneBytes(rawJSON),
-	}
-	if cloned := cloneMetadata(metadata); cloned != nil {
-		req.Metadata = cloned
 	}
 	opts := coreexecutor.Options{
 		Stream:          false,
@@ -350,7 +402,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		OriginalRequest: cloneBytes(rawJSON),
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
-	opts.Metadata = mergeMetadata(cloneMetadata(metadata), reqMeta)
+	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -373,17 +425,15 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
-	providers, normalizedModel, metadata, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	req := coreexecutor.Request{
 		Model:   normalizedModel,
 		Payload: cloneBytes(rawJSON),
-	}
-	if cloned := cloneMetadata(metadata); cloned != nil {
-		req.Metadata = cloned
 	}
 	opts := coreexecutor.Options{
 		Stream:          false,
@@ -391,7 +441,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		OriginalRequest: cloneBytes(rawJSON),
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
-	opts.Metadata = mergeMetadata(cloneMetadata(metadata), reqMeta)
+	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -414,7 +464,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 // ExecuteStreamWithAuthManager executes a streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, <-chan *interfaces.ErrorMessage) {
-	providers, normalizedModel, metadata, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
@@ -422,12 +472,10 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		return nil, errChan
 	}
 	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	req := coreexecutor.Request{
 		Model:   normalizedModel,
 		Payload: cloneBytes(rawJSON),
-	}
-	if cloned := cloneMetadata(metadata); cloned != nil {
-		req.Metadata = cloned
 	}
 	opts := coreexecutor.Options{
 		Stream:          true,
@@ -435,7 +483,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		OriginalRequest: cloneBytes(rawJSON),
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
-	opts.Metadata = mergeMetadata(cloneMetadata(metadata), reqMeta)
+	opts.Metadata = reqMeta
 	chunks, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -463,6 +511,32 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		sentPayload := false
 		bootstrapRetries := 0
 		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+
+		sendErr := func(msg *interfaces.ErrorMessage) bool {
+			if ctx == nil {
+				errChan <- msg
+				return true
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case errChan <- msg:
+				return true
+			}
+		}
+
+		sendData := func(chunk []byte) bool {
+			if ctx == nil {
+				dataChan <- chunk
+				return true
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case dataChan <- chunk:
+				return true
+			}
+		}
 
 		bootstrapEligible := func(err error) bool {
 			status := statusFromError(err)
@@ -523,12 +597,14 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 							addon = hdr.Clone()
 						}
 					}
-					errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon}
+					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
 					return
 				}
 				if len(chunk.Payload) > 0 {
 					sentPayload = true
-					dataChan <- cloneBytes(chunk.Payload)
+					if okSendData := sendData(cloneBytes(chunk.Payload)); !okSendData {
+						return
+					}
 				}
 			}
 		}
@@ -548,94 +624,40 @@ func statusFromError(err error) int {
 	return 0
 }
 
-func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, metadata map[string]any, err *interfaces.ErrorMessage) {
-	return h.getRequestDetailsWithMapping(modelName, nil)
-}
-
-// getRequestDetailsWithMapping resolves model details and optionally applies model mapping.
-// If mappedModelOut is non-nil and a mapping was applied, it will be set to the mapped model name.
-func (h *BaseAPIHandler) getRequestDetailsWithMapping(modelName string, mappedModelOut *string) (providers []string, normalizedModel string, metadata map[string]any, err *interfaces.ErrorMessage) {
-	// Resolve "auto" model to an actual available model first
-	resolvedModelName := util.ResolveAutoModel(modelName)
-
-	// Normalize the model name to handle dynamic thinking suffixes before determining the provider.
-	normalizedModel, metadata = normalizeModelMetadata(resolvedModelName)
-
-	// Use the normalizedModel to get the provider name.
-	providers = util.GetProviderName(normalizedModel)
-	if len(providers) == 0 && metadata != nil {
-		if originalRaw, ok := metadata[util.ThinkingOriginalModelMetadataKey]; ok {
-			if originalModel, okStr := originalRaw.(string); okStr {
-				originalModel = strings.TrimSpace(originalModel)
-				if originalModel != "" && !strings.EqualFold(originalModel, normalizedModel) {
-					if altProviders := util.GetProviderName(originalModel); len(altProviders) > 0 {
-						providers = altProviders
-						normalizedModel = originalModel
-					}
-				}
-			}
+func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+	resolvedModelName := modelName
+	initialSuffix := thinking.ParseSuffix(modelName)
+	if initialSuffix.ModelName == "auto" {
+		resolvedBase := util.ResolveAutoModel(initialSuffix.ModelName)
+		if initialSuffix.HasSuffix {
+			resolvedModelName = fmt.Sprintf("%s(%s)", resolvedBase, initialSuffix.RawSuffix)
+		} else {
+			resolvedModelName = resolvedBase
 		}
+	} else {
+		resolvedModelName = util.ResolveAutoModel(modelName)
 	}
 
-	// 如果没有找到 provider，尝试使用全局模型映射
-	// If no provider found, try global model mapping
-	if len(providers) == 0 && h.ModelMapper != nil {
-		// 尝试映射原始模型名
-		mappedModel := h.ModelMapper.MapModel(modelName)
-		if mappedModel == "" {
-			// 尝试映射规范化后的模型名
-			mappedModel = h.ModelMapper.MapModel(normalizedModel)
-		}
+	parsed := thinking.ParseSuffix(resolvedModelName)
+	baseModel := strings.TrimSpace(parsed.ModelName)
 
-		if mappedModel != "" {
-			// 保留动态思考后缀
-			// Preserve dynamic thinking suffix if present
-			thinkingSuffix := ""
-			if metadata != nil {
-				if _, hasThinking := metadata[util.ThinkingOriginalModelMetadataKey]; hasThinking {
-					if strings.HasPrefix(modelName, normalizedModel) {
-						thinkingSuffix = modelName[len(normalizedModel):]
-					}
-				}
-			}
-
-			// 检查映射目标是否已有思考后缀
-			mappedBaseModel, mappedThinkingMetadata := util.NormalizeThinkingModel(mappedModel)
-			if thinkingSuffix != "" && mappedThinkingMetadata == nil {
-				mappedModel = mappedModel + thinkingSuffix
-			}
-
-			// 获取映射后模型的 provider
-			mappedNormalized, mappedMeta := normalizeModelMetadata(mappedModel)
-			mappedProviders := util.GetProviderName(mappedNormalized)
-			if len(mappedProviders) == 0 {
-				mappedProviders = util.GetProviderName(mappedBaseModel)
-			}
-
-			if len(mappedProviders) > 0 {
-				// 映射成功，更新返回值
-				providers = mappedProviders
-				normalizedModel = mappedNormalized
-				if mappedMeta != nil {
-					metadata = mappedMeta
-				}
-				// 输出映射到的模型名
-				if mappedModelOut != nil {
-					*mappedModelOut = mappedModel
-				}
-			}
-		}
+	providers = util.GetProviderName(baseModel)
+	// Fallback: if baseModel has no provider but differs from resolvedModelName,
+	// try using the full model name. This handles edge cases where custom models
+	// may be registered with their full suffixed name (e.g., "my-model(8192)").
+	// Evaluated in Story 11.8: This fallback is intentionally preserved to support
+	// custom model registrations that include thinking suffixes.
+	if len(providers) == 0 && baseModel != resolvedModelName {
+		providers = util.GetProviderName(resolvedModelName)
 	}
 
 	if len(providers) == 0 {
-		return nil, "", nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("unknown provider for model %s", modelName)}
+		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
 	}
 
-	// If it's a dynamic model, the normalizedModel was already set to extractedModelName.
-	// If it's a non-dynamic model, normalizedModel was set by normalizeModelMetadata.
-	// So, normalizedModel is already correctly set at this point.
-
-	return providers, normalizedModel, metadata, nil
+	// The thinking suffix is preserved in the model name itself, so no
+	// metadata-based configuration passing is needed.
+	return providers, resolvedModelName, nil
 }
 
 func cloneBytes(src []byte) []byte {
@@ -645,10 +667,6 @@ func cloneBytes(src []byte) []byte {
 	dst := make([]byte, len(src))
 	copy(dst, src)
 	return dst
-}
-
-func normalizeModelMetadata(modelName string) (string, map[string]any) {
-	return util.NormalizeThinkingModel(modelName)
 }
 
 func cloneMetadata(src map[string]any) map[string]any {

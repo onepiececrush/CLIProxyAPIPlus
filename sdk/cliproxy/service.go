@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -97,6 +98,16 @@ func (s *Service) RegisterUsagePlugin(plugin usage.Plugin) {
 	usage.RegisterPlugin(plugin)
 }
 
+// GetWatcher returns the underlying WatcherWrapper instance.
+// This allows external components (e.g., RefreshManager) to interact with the watcher.
+// Returns nil if the service or watcher is not initialized.
+func (s *Service) GetWatcher() *WatcherWrapper {
+	if s == nil {
+		return nil
+	}
+	return s.watcher
+}
+
 // newDefaultAuthManager creates a default authentication manager with all supported providers.
 func newDefaultAuthManager() *sdkAuth.Manager {
 	return sdkAuth.NewManager(
@@ -124,6 +135,7 @@ func (s *Service) ensureAuthUpdateQueue(ctx context.Context) {
 }
 
 func (s *Service) consumeAuthUpdates(ctx context.Context) {
+	ctx = coreauth.WithSkipPersist(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -546,7 +558,6 @@ func (s *Service) Run(ctx context.Context) error {
 				selector = &coreauth.RoundRobinSelector{}
 			}
 			s.coreManager.SetSelector(selector)
-			log.Infof("routing strategy updated to %s", nextStrategy)
 		}
 
 		s.applyRetryConfig(newCfg)
@@ -557,7 +568,8 @@ func (s *Service) Run(ctx context.Context) error {
 		s.cfg = newCfg
 		s.cfgMu.Unlock()
 		if s.coreManager != nil {
-			s.coreManager.SetOAuthModelMappings(newCfg.OAuthModelMappings)
+			s.coreManager.SetConfig(newCfg)
+			s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
 		}
 		s.rebindExecutors()
 	}
@@ -572,6 +584,18 @@ func (s *Service) Run(ctx context.Context) error {
 		watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
 	}
 	watcherWrapper.SetConfig(s.cfg)
+
+	// 方案 A: 连接 Kiro 后台刷新器回调到 Watcher
+	// 当后台刷新器成功刷新 token 后，立即通知 Watcher 更新内存中的 Auth 对象
+	// 这解决了后台刷新与内存 Auth 对象之间的时间差问题
+	kiroauth.GetRefreshManager().SetOnTokenRefreshed(func(tokenID string, tokenData *kiroauth.KiroTokenData) {
+		if tokenData == nil || watcherWrapper == nil {
+			return
+		}
+		log.Debugf("kiro refresh callback: notifying watcher for token %s", tokenID)
+		watcherWrapper.NotifyTokenRefreshed(tokenID, tokenData.AccessToken, tokenData.RefreshToken, tokenData.ExpiresAt)
+	})
+	log.Debug("kiro: connected background refresh callback to watcher")
 
 	watcherCtx, watcherCancel := context.WithCancel(context.Background())
 	s.watcherCancel = watcherCancel
@@ -683,6 +707,10 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	if a == nil || a.ID == "" {
 		return
 	}
+	if a.Disabled {
+		GlobalModelRegistry().UnregisterClient(a.ID)
+		return
+	}
 	authKind := strings.ToLower(strings.TrimSpace(a.Attributes["auth_kind"]))
 	if authKind == "" {
 		if kind, _ := a.AccountInfo(); strings.EqualFold(kind, "api_key") {
@@ -769,11 +797,12 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = applyExcludedModels(models, excluded)
 	case "iflow":
 		models = registry.GetIFlowModels()
+		models = applyExcludedModels(models, excluded)
 	case "github-copilot":
 		models = registry.GetGitHubCopilotModels()
 		models = applyExcludedModels(models, excluded)
 	case "kiro":
-		models = registry.GetKiroModels()
+		models = s.fetchKiroModels(a)
 		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
@@ -834,6 +863,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 							OwnedBy:     compat.Name,
 							Type:        "openai-compatibility",
 							DisplayName: modelID,
+							UserDefined: true,
 						})
 					}
 					// Register and return
@@ -856,7 +886,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 	}
-	models = applyOAuthModelMappings(s.cfg, provider, authKind, models)
+	models = applyOAuthModelAlias(s.cfg, provider, authKind, models)
 	if len(models) > 0 {
 		key := provider
 		if key == "" {
@@ -1166,6 +1196,7 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 			OwnedBy:     ownedBy,
 			Type:        modelType,
 			DisplayName: display,
+			UserDefined: true,
 		}
 		if name != "" {
 			if upstream := registry.LookupStaticModelInfo(name); upstream != nil && upstream.Thinking != nil {
@@ -1218,6 +1249,9 @@ func rewriteModelInfoName(name, oldID, newID string) string {
 	if strings.EqualFold(oldID, newID) {
 		return name
 	}
+	if strings.EqualFold(trimmed, oldID) {
+		return newID
+	}
 	if strings.HasSuffix(trimmed, "/"+oldID) {
 		prefix := strings.TrimSuffix(trimmed, oldID)
 		return prefix + newID
@@ -1228,28 +1262,28 @@ func rewriteModelInfoName(name, oldID, newID string) string {
 	return name
 }
 
-func applyOAuthModelMappings(cfg *config.Config, provider, authKind string, models []*ModelInfo) []*ModelInfo {
+func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models []*ModelInfo) []*ModelInfo {
 	if cfg == nil || len(models) == 0 {
 		return models
 	}
-	channel := coreauth.OAuthModelMappingChannel(provider, authKind)
-	if channel == "" || len(cfg.OAuthModelMappings) == 0 {
+	channel := coreauth.OAuthModelAliasChannel(provider, authKind)
+	if channel == "" || len(cfg.OAuthModelAlias) == 0 {
 		return models
 	}
-	mappings := cfg.OAuthModelMappings[channel]
-	if len(mappings) == 0 {
+	aliases := cfg.OAuthModelAlias[channel]
+	if len(aliases) == 0 {
 		return models
 	}
 
-	type mappingEntry struct {
+	type aliasEntry struct {
 		alias string
 		fork  bool
 	}
 
-	forward := make(map[string]mappingEntry, len(mappings))
-	for i := range mappings {
-		name := strings.TrimSpace(mappings[i].Name)
-		alias := strings.TrimSpace(mappings[i].Alias)
+	forward := make(map[string][]aliasEntry, len(aliases))
+	for i := range aliases {
+		name := strings.TrimSpace(aliases[i].Name)
+		alias := strings.TrimSpace(aliases[i].Alias)
 		if name == "" || alias == "" {
 			continue
 		}
@@ -1257,14 +1291,12 @@ func applyOAuthModelMappings(cfg *config.Config, provider, authKind string, mode
 			continue
 		}
 		key := strings.ToLower(name)
-		if _, exists := forward[key]; exists {
-			continue
-		}
-		forward[key] = mappingEntry{alias: alias, fork: mappings[i].Fork}
+		forward[key] = append(forward[key], aliasEntry{alias: alias, fork: aliases[i].Fork})
 	}
 	if len(forward) == 0 {
 		return models
 	}
+
 	out := make([]*ModelInfo, 0, len(models))
 	seen := make(map[string]struct{}, len(models))
 	for _, model := range models {
@@ -1276,17 +1308,8 @@ func applyOAuthModelMappings(cfg *config.Config, provider, authKind string, mode
 			continue
 		}
 		key := strings.ToLower(id)
-		entry, ok := forward[key]
-		if !ok {
-			if _, exists := seen[key]; exists {
-				continue
-			}
-			seen[key] = struct{}{}
-			out = append(out, model)
-			continue
-		}
-		mappedID := strings.TrimSpace(entry.alias)
-		if mappedID == "" {
+		entries := forward[key]
+		if len(entries) == 0 {
 			if _, exists := seen[key]; exists {
 				continue
 			}
@@ -1295,10 +1318,28 @@ func applyOAuthModelMappings(cfg *config.Config, provider, authKind string, mode
 			continue
 		}
 
-		if entry.fork {
+		keepOriginal := false
+		for _, entry := range entries {
+			if entry.fork {
+				keepOriginal = true
+				break
+			}
+		}
+		if keepOriginal {
 			if _, exists := seen[key]; !exists {
 				seen[key] = struct{}{}
 				out = append(out, model)
+			}
+		}
+
+		addedAlias := false
+		for _, entry := range entries {
+			mappedID := strings.TrimSpace(entry.alias)
+			if mappedID == "" {
+				continue
+			}
+			if strings.EqualFold(mappedID, id) {
+				continue
 			}
 			aliasKey := strings.ToLower(mappedID)
 			if _, exists := seen[aliasKey]; exists {
@@ -1311,24 +1352,229 @@ func applyOAuthModelMappings(cfg *config.Config, provider, authKind string, mode
 				clone.Name = rewriteModelInfoName(clone.Name, id, mappedID)
 			}
 			out = append(out, &clone)
+			addedAlias = true
+		}
+
+		if !keepOriginal && !addedAlias {
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, model)
+		}
+	}
+	return out
+}
+
+// fetchKiroModels attempts to dynamically fetch Kiro models from the API.
+// If dynamic fetch fails, it falls back to static registry.GetKiroModels().
+func (s *Service) fetchKiroModels(a *coreauth.Auth) []*ModelInfo {
+	if a == nil {
+		log.Debug("kiro: auth is nil, using static models")
+		return registry.GetKiroModels()
+	}
+
+	// Extract token data from auth attributes
+	tokenData := s.extractKiroTokenData(a)
+	if tokenData == nil || tokenData.AccessToken == "" {
+		log.Debug("kiro: no valid token data in auth, using static models")
+		return registry.GetKiroModels()
+	}
+
+	// Create KiroAuth instance
+	kAuth := kiroauth.NewKiroAuth(s.cfg)
+	if kAuth == nil {
+		log.Warn("kiro: failed to create KiroAuth instance, using static models")
+		return registry.GetKiroModels()
+	}
+
+	// Use timeout context for API call
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Attempt to fetch dynamic models
+	apiModels, err := kAuth.ListAvailableModels(ctx, tokenData)
+	if err != nil {
+		log.Warnf("kiro: failed to fetch dynamic models: %v, using static models", err)
+		return registry.GetKiroModels()
+	}
+
+	if len(apiModels) == 0 {
+		log.Debug("kiro: API returned no models, using static models")
+		return registry.GetKiroModels()
+	}
+
+	// Convert API models to ModelInfo
+	models := convertKiroAPIModels(apiModels)
+
+	// Generate agentic variants
+	models = generateKiroAgenticVariants(models)
+
+	log.Infof("kiro: successfully fetched %d models from API (including agentic variants)", len(models))
+	return models
+}
+
+// extractKiroTokenData extracts KiroTokenData from auth attributes and metadata.
+// It supports both config-based tokens (stored in Attributes) and file-based tokens (stored in Metadata).
+func (s *Service) extractKiroTokenData(a *coreauth.Auth) *kiroauth.KiroTokenData {
+	if a == nil {
+		return nil
+	}
+
+	var accessToken, profileArn, refreshToken string
+
+	// Priority 1: Try to get from Attributes (config.yaml source)
+	if a.Attributes != nil {
+		accessToken = strings.TrimSpace(a.Attributes["access_token"])
+		profileArn = strings.TrimSpace(a.Attributes["profile_arn"])
+		refreshToken = strings.TrimSpace(a.Attributes["refresh_token"])
+	}
+
+	// Priority 2: If not found in Attributes, try Metadata (JSON file source)
+	if accessToken == "" && a.Metadata != nil {
+		if at, ok := a.Metadata["access_token"].(string); ok {
+			accessToken = strings.TrimSpace(at)
+		}
+		if pa, ok := a.Metadata["profile_arn"].(string); ok {
+			profileArn = strings.TrimSpace(pa)
+		}
+		if rt, ok := a.Metadata["refresh_token"].(string); ok {
+			refreshToken = strings.TrimSpace(rt)
+		}
+	}
+
+	// access_token is required
+	if accessToken == "" {
+		return nil
+	}
+
+	return &kiroauth.KiroTokenData{
+		AccessToken:  accessToken,
+		ProfileArn:   profileArn,
+		RefreshToken: refreshToken,
+	}
+}
+
+// convertKiroAPIModels converts Kiro API models to ModelInfo slice.
+func convertKiroAPIModels(apiModels []*kiroauth.KiroModel) []*ModelInfo {
+	if len(apiModels) == 0 {
+		return nil
+	}
+
+	now := time.Now().Unix()
+	models := make([]*ModelInfo, 0, len(apiModels))
+
+	for _, m := range apiModels {
+		if m == nil || m.ModelID == "" {
 			continue
 		}
 
-		uniqueKey := strings.ToLower(mappedID)
-		if _, exists := seen[uniqueKey]; exists {
-			continue
+		// Create model ID with kiro- prefix
+		modelID := "kiro-" + normalizeKiroModelID(m.ModelID)
+
+		info := &ModelInfo{
+			ID:                  modelID,
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "aws",
+			Type:                "kiro",
+			DisplayName:         formatKiroDisplayName(m.ModelName, m.RateMultiplier),
+			Description:         m.Description,
+			ContextLength:       200000,
+			MaxCompletionTokens: 64000,
+			Thinking:            &registry.ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
 		}
-		seen[uniqueKey] = struct{}{}
-		if mappedID == id {
-			out = append(out, model)
-			continue
+
+		if m.MaxInputTokens > 0 {
+			info.ContextLength = m.MaxInputTokens
 		}
-		clone := *model
-		clone.ID = mappedID
-		if clone.Name != "" {
-			clone.Name = rewriteModelInfoName(clone.Name, id, mappedID)
-		}
-		out = append(out, &clone)
+
+		models = append(models, info)
 	}
-	return out
+
+	return models
+}
+
+// normalizeKiroModelID normalizes a Kiro model ID by converting dots to dashes
+// and removing common prefixes.
+func normalizeKiroModelID(modelID string) string {
+	// Remove common prefixes
+	modelID = strings.TrimPrefix(modelID, "anthropic.")
+	modelID = strings.TrimPrefix(modelID, "amazon.")
+
+	// Replace dots with dashes for consistency
+	modelID = strings.ReplaceAll(modelID, ".", "-")
+
+	// Replace underscores with dashes
+	modelID = strings.ReplaceAll(modelID, "_", "-")
+
+	return strings.ToLower(modelID)
+}
+
+// formatKiroDisplayName formats the display name with rate multiplier info.
+func formatKiroDisplayName(modelName string, rateMultiplier float64) string {
+	if modelName == "" {
+		return ""
+	}
+
+	displayName := "Kiro " + modelName
+	if rateMultiplier > 0 && rateMultiplier != 1.0 {
+		displayName += fmt.Sprintf(" (%.1fx credit)", rateMultiplier)
+	}
+
+	return displayName
+}
+
+// generateKiroAgenticVariants generates agentic variants for Kiro models.
+// Agentic variants have optimized system prompts for coding agents.
+func generateKiroAgenticVariants(models []*ModelInfo) []*ModelInfo {
+	if len(models) == 0 {
+		return models
+	}
+
+	result := make([]*ModelInfo, 0, len(models)*2)
+	result = append(result, models...)
+
+	for _, m := range models {
+		if m == nil {
+			continue
+		}
+
+		// Skip if already an agentic variant
+		if strings.HasSuffix(m.ID, "-agentic") {
+			continue
+		}
+
+		// Skip auto models from agentic variant generation
+		if strings.Contains(m.ID, "-auto") {
+			continue
+		}
+
+		// Create agentic variant
+		agentic := &ModelInfo{
+			ID:                  m.ID + "-agentic",
+			Object:              m.Object,
+			Created:             m.Created,
+			OwnedBy:             m.OwnedBy,
+			Type:                m.Type,
+			DisplayName:         m.DisplayName + " (Agentic)",
+			Description:         m.Description + " - Optimized for coding agents (chunked writes)",
+			ContextLength:       m.ContextLength,
+			MaxCompletionTokens: m.MaxCompletionTokens,
+		}
+
+		// Copy thinking support if present
+		if m.Thinking != nil {
+			agentic.Thinking = &registry.ThinkingSupport{
+				Min:            m.Thinking.Min,
+				Max:            m.Thinking.Max,
+				ZeroAllowed:    m.Thinking.ZeroAllowed,
+				DynamicAllowed: m.Thinking.DynamicAllowed,
+			}
+		}
+
+		result = append(result, agentic)
+	}
+
+	return result
 }

@@ -7,13 +7,16 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,12 +31,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
-
 )
 
 const (
 	// Kiro API common constants
-	kiroContentType  = "application/x-amz-json-1.0"
+	kiroContentType  = "application/json"
 	kiroAcceptStream = "*/*"
 
 	// Event Stream frame size constants for boundary protection
@@ -45,16 +47,37 @@ const (
 	// Event Stream error type constants
 	ErrStreamFatal     = "fatal"     // Connection/authentication errors, not recoverable
 	ErrStreamMalformed = "malformed" // Format errors, data cannot be parsed
-	// kiroUserAgent matches amq2api format for User-Agent header (Amazon Q CLI style)
+
+	// kiroUserAgent matches Amazon Q CLI style for User-Agent header
 	kiroUserAgent = "aws-sdk-rust/1.3.9 os/macos lang/rust/1.87.0"
-	// kiroFullUserAgent is the complete x-amz-user-agent header matching amq2api (Amazon Q CLI style)
+	// kiroFullUserAgent is the complete x-amz-user-agent header (Amazon Q CLI style)
 	kiroFullUserAgent = "aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/macos lang/rust/1.87.0 m/E app/AmazonQ-For-CLI"
 
-	// Kiro IDE style headers (from kiro2api - for IDC auth)
-	kiroIDEUserAgent     = "aws-sdk-js/1.0.18 ua/2.1 os/darwin#25.0.0 lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.2.13-66c23a8c5d15afabec89ef9954ef52a119f10d369df04d548fc6c1eac694b0d1"
-	kiroIDEAmzUserAgent  = "aws-sdk-js/1.0.18 KiroIDE-0.2.13-66c23a8c5d15afabec89ef9954ef52a119f10d369df04d548fc6c1eac694b0d1"
-	kiroIDEAgentModeSpec = "spec"
+	// Kiro IDE style headers for IDC auth
+	kiroIDEUserAgent     = "aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E"
+	kiroIDEAmzUserAgent  = "aws-sdk-js/1.0.27"
+	kiroIDEAgentModeVibe = "vibe"
+
+	// Socket retry configuration constants
+	// Maximum number of retry attempts for socket/network errors
+	kiroSocketMaxRetries = 3
+	// Base delay between retry attempts (uses exponential backoff: delay * 2^attempt)
+	kiroSocketBaseRetryDelay = 1 * time.Second
+	// Maximum delay between retry attempts (cap for exponential backoff)
+	kiroSocketMaxRetryDelay = 30 * time.Second
+	// First token timeout for streaming responses (how long to wait for first response)
+	kiroFirstTokenTimeout = 15 * time.Second
+	// Streaming read timeout (how long to wait between chunks)
+	kiroStreamingReadTimeout = 300 * time.Second
 )
+
+// retryableHTTPStatusCodes defines HTTP status codes that are considered retryable.
+// Based on kiro2Api reference: 502 (Bad Gateway), 503 (Service Unavailable), 504 (Gateway Timeout)
+var retryableHTTPStatusCodes = map[int]bool{
+	502: true, // Bad Gateway - upstream server error
+	503: true, // Service Unavailable - server temporarily overloaded
+	504: true, // Gateway Timeout - upstream server timeout
+}
 
 // Real-time usage estimation configuration
 // These control how often usage updates are sent during streaming
@@ -62,6 +85,241 @@ var (
 	usageUpdateCharThreshold = 5000             // Send usage update every 5000 characters
 	usageUpdateTimeInterval  = 15 * time.Second // Or every 15 seconds, whichever comes first
 )
+
+// Global FingerprintManager for dynamic User-Agent generation per token
+// Each token gets a unique fingerprint on first use, which is cached for subsequent requests
+var (
+	globalFingerprintManager     *kiroauth.FingerprintManager
+	globalFingerprintManagerOnce sync.Once
+)
+
+// getGlobalFingerprintManager returns the global FingerprintManager instance
+func getGlobalFingerprintManager() *kiroauth.FingerprintManager {
+	globalFingerprintManagerOnce.Do(func() {
+		globalFingerprintManager = kiroauth.NewFingerprintManager()
+		log.Infof("kiro: initialized global FingerprintManager for dynamic UA generation")
+	})
+	return globalFingerprintManager
+}
+
+// retryConfig holds configuration for socket retry logic.
+// Based on kiro2Api Python implementation patterns.
+type retryConfig struct {
+	MaxRetries      int           // Maximum number of retry attempts
+	BaseDelay       time.Duration // Base delay between retries (exponential backoff)
+	MaxDelay        time.Duration // Maximum delay cap
+	RetryableErrors []string      // List of retryable error patterns
+	RetryableStatus map[int]bool  // HTTP status codes to retry
+	FirstTokenTmout time.Duration // Timeout for first token in streaming
+	StreamReadTmout time.Duration // Timeout between stream chunks
+}
+
+// defaultRetryConfig returns the default retry configuration for Kiro socket operations.
+func defaultRetryConfig() retryConfig {
+	return retryConfig{
+		MaxRetries:      kiroSocketMaxRetries,
+		BaseDelay:       kiroSocketBaseRetryDelay,
+		MaxDelay:        kiroSocketMaxRetryDelay,
+		RetryableStatus: retryableHTTPStatusCodes,
+		RetryableErrors: []string{
+			"connection reset",
+			"connection refused",
+			"broken pipe",
+			"EOF",
+			"timeout",
+			"temporary failure",
+			"no such host",
+			"network is unreachable",
+			"i/o timeout",
+		},
+		FirstTokenTmout: kiroFirstTokenTimeout,
+		StreamReadTmout: kiroStreamingReadTimeout,
+	}
+}
+
+// isRetryableError checks if an error is retryable based on error type and message.
+// Returns true for network timeouts, connection resets, and temporary failures.
+// Based on kiro2Api's retry logic patterns.
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for context cancellation - not retryable
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	// Check for net.Error (timeout, temporary)
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			log.Debugf("kiro: isRetryableError: network timeout detected")
+			return true
+		}
+		// Note: Temporary() is deprecated but still useful for some error types
+	}
+
+	// Check for specific syscall errors (connection reset, broken pipe, etc.)
+	var syscallErr syscall.Errno
+	if errors.As(err, &syscallErr) {
+		switch syscallErr {
+		case syscall.ECONNRESET: // Connection reset by peer
+			log.Debugf("kiro: isRetryableError: ECONNRESET detected")
+			return true
+		case syscall.ECONNREFUSED: // Connection refused
+			log.Debugf("kiro: isRetryableError: ECONNREFUSED detected")
+			return true
+		case syscall.EPIPE: // Broken pipe
+			log.Debugf("kiro: isRetryableError: EPIPE (broken pipe) detected")
+			return true
+		case syscall.ETIMEDOUT: // Connection timed out
+			log.Debugf("kiro: isRetryableError: ETIMEDOUT detected")
+			return true
+		case syscall.ENETUNREACH: // Network is unreachable
+			log.Debugf("kiro: isRetryableError: ENETUNREACH detected")
+			return true
+		case syscall.EHOSTUNREACH: // No route to host
+			log.Debugf("kiro: isRetryableError: EHOSTUNREACH detected")
+			return true
+		}
+	}
+
+	// Check for net.OpError wrapping other errors
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		log.Debugf("kiro: isRetryableError: net.OpError detected, op=%s", opErr.Op)
+		// Recursively check the wrapped error
+		if opErr.Err != nil {
+			return isRetryableError(opErr.Err)
+		}
+		return true
+	}
+
+	// Check error message for retryable patterns
+	errMsg := strings.ToLower(err.Error())
+	cfg := defaultRetryConfig()
+	for _, pattern := range cfg.RetryableErrors {
+		if strings.Contains(errMsg, pattern) {
+			log.Debugf("kiro: isRetryableError: pattern '%s' matched in error: %s", pattern, errMsg)
+			return true
+		}
+	}
+
+	// Check for EOF which may indicate connection was closed
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		log.Debugf("kiro: isRetryableError: EOF/UnexpectedEOF detected")
+		return true
+	}
+
+	return false
+}
+
+// isRetryableHTTPStatus checks if an HTTP status code is retryable.
+// Based on kiro2Api: 502, 503, 504 are retryable server errors.
+func isRetryableHTTPStatus(statusCode int) bool {
+	return retryableHTTPStatusCodes[statusCode]
+}
+
+// calculateRetryDelay calculates the delay for the next retry attempt using exponential backoff.
+// delay = min(baseDelay * 2^attempt, maxDelay)
+// Adds ±30% jitter to prevent thundering herd.
+func calculateRetryDelay(attempt int, cfg retryConfig) time.Duration {
+	return kiroauth.ExponentialBackoffWithJitter(attempt, cfg.BaseDelay, cfg.MaxDelay)
+}
+
+// logRetryAttempt logs a retry attempt with relevant context.
+func logRetryAttempt(attempt, maxRetries int, reason string, delay time.Duration, endpoint string) {
+	log.Warnf("kiro: retry attempt %d/%d for %s, waiting %v before next attempt (endpoint: %s)",
+		attempt+1, maxRetries, reason, delay, endpoint)
+}
+
+// kiroHTTPClientPool provides a shared HTTP client with connection pooling for Kiro API.
+// This reduces connection overhead and improves performance for concurrent requests.
+// Based on kiro2Api's connection pooling pattern.
+var (
+	kiroHTTPClientPool     *http.Client
+	kiroHTTPClientPoolOnce sync.Once
+)
+
+// getKiroPooledHTTPClient returns a shared HTTP client with optimized connection pooling.
+// The client is lazily initialized on first use and reused across requests.
+// This is especially beneficial for:
+// - Reducing TCP handshake overhead
+// - Enabling HTTP/2 multiplexing
+// - Better handling of keep-alive connections
+func getKiroPooledHTTPClient() *http.Client {
+	kiroHTTPClientPoolOnce.Do(func() {
+		transport := &http.Transport{
+			// Connection pool settings
+			MaxIdleConns:        100,              // Max idle connections across all hosts
+			MaxIdleConnsPerHost: 20,               // Max idle connections per host
+			MaxConnsPerHost:     50,               // Max total connections per host
+			IdleConnTimeout:     90 * time.Second, // How long idle connections stay in pool
+
+			// Timeouts for connection establishment
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second, // TCP connection timeout
+				KeepAlive: 30 * time.Second, // TCP keep-alive interval
+			}).DialContext,
+
+			// TLS handshake timeout
+			TLSHandshakeTimeout: 10 * time.Second,
+
+			// Response header timeout
+			ResponseHeaderTimeout: 30 * time.Second,
+
+			// Expect 100-continue timeout
+			ExpectContinueTimeout: 1 * time.Second,
+
+			// Enable HTTP/2 when available
+			ForceAttemptHTTP2: true,
+		}
+
+		kiroHTTPClientPool = &http.Client{
+			Transport: transport,
+			// No global timeout - let individual requests set their own timeouts via context
+		}
+
+		log.Debugf("kiro: initialized pooled HTTP client (MaxIdleConns=%d, MaxIdleConnsPerHost=%d, MaxConnsPerHost=%d)",
+			transport.MaxIdleConns, transport.MaxIdleConnsPerHost, transport.MaxConnsPerHost)
+	})
+
+	return kiroHTTPClientPool
+}
+
+// newKiroHTTPClientWithPooling creates an HTTP client that uses connection pooling when appropriate.
+// It respects proxy configuration from auth or config, falling back to the pooled client.
+// This provides the best of both worlds: custom proxy support + connection reuse.
+func newKiroHTTPClientWithPooling(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	// Check if a proxy is configured - if so, we need a custom client
+	var proxyURL string
+	if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
+	}
+	if proxyURL == "" && cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+
+	// If proxy is configured, use the existing proxy-aware client (doesn't pool)
+	if proxyURL != "" {
+		log.Debugf("kiro: using proxy-aware HTTP client (proxy=%s)", proxyURL)
+		return newProxyAwareHTTPClient(ctx, cfg, auth, timeout)
+	}
+
+	// No proxy - use pooled client for better performance
+	pooledClient := getKiroPooledHTTPClient()
+
+	// If timeout is specified, we need to wrap the pooled transport with timeout
+	if timeout > 0 {
+		return &http.Client{
+			Transport: pooledClient.Transport,
+			Timeout:   timeout,
+		}
+	}
+
+	return pooledClient
+}
 
 // kiroEndpointConfig bundles endpoint URL with its compatible Origin and AmzTarget values.
 // This solves the "triple mismatch" problem where different endpoints require matching
@@ -77,52 +335,111 @@ type kiroEndpointConfig struct {
 	Name      string // Endpoint name for logging
 }
 
-// kiroEndpointConfigs defines the available Kiro API endpoints with their compatible configurations.
-// The order determines fallback priority: primary endpoint first, then fallbacks.
-//
-// CRITICAL: Each endpoint MUST use its compatible Origin and AmzTarget values:
-// - CodeWhisperer endpoint (codewhisperer.us-east-1.amazonaws.com): Uses AI_EDITOR origin and AmazonCodeWhispererStreamingService target
-// - Amazon Q endpoint (q.us-east-1.amazonaws.com): Uses CLI origin and AmazonQDeveloperStreamingService target
-//
-// Mismatched combinations will result in 403 Forbidden errors.
-//
-// NOTE: CodeWhisperer is set as the default endpoint because:
-// 1. Most tokens come from Kiro IDE / VSCode extensions (AWS Builder ID auth)
-// 2. These tokens use AI_EDITOR origin which is only compatible with CodeWhisperer endpoint
-// 3. Amazon Q endpoint requires CLI origin which is for Amazon Q CLI tokens
-// This matches the AIClient-2-API-main project's configuration.
-var kiroEndpointConfigs = []kiroEndpointConfig{
-	{
-		URL:       "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-		Name:      "CodeWhisperer",
-	},
-	{
-		URL:       "https://q.us-east-1.amazonaws.com/",
-		Origin:    "CLI",
-		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
-		Name:      "AmazonQ",
-	},
+// kiroDefaultRegion is the default AWS region for Kiro API endpoints.
+// Used when no region is specified in auth metadata.
+const kiroDefaultRegion = "us-east-1"
+
+// extractRegionFromProfileARN extracts the AWS region from a ProfileARN.
+// ARN format: arn:aws:codewhisperer:REGION:ACCOUNT:profile/PROFILE_ID
+// Returns empty string if region cannot be extracted.
+func extractRegionFromProfileARN(profileArn string) string {
+	if profileArn == "" {
+		return ""
+	}
+	parts := strings.Split(profileArn, ":")
+	if len(parts) >= 4 && parts[3] != "" {
+		return parts[3]
+	}
+	return ""
 }
 
+// buildKiroEndpointConfigs creates endpoint configurations for the specified region.
+// This enables dynamic region support for Enterprise/IdC users in non-us-east-1 regions.
+//
+// Uses Q endpoint (q.{region}.amazonaws.com) as primary for ALL auth types:
+// - Works universally across all AWS regions (CodeWhisperer endpoint only exists in us-east-1)
+// - Uses /generateAssistantResponse path with AI_EDITOR origin
+// - Does NOT require X-Amz-Target header
+//
+// The AmzTarget field is kept for backward compatibility but should be empty
+// to indicate that the header should NOT be set.
+func buildKiroEndpointConfigs(region string) []kiroEndpointConfig {
+	if region == "" {
+		region = kiroDefaultRegion
+	}
+	return []kiroEndpointConfig{
+		{
+			// Primary: Q endpoint - works for all regions and auth types
+			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "", // Empty = don't set X-Amz-Target header
+			Name:      "AmazonQ",
+		},
+		{
+			// Fallback: CodeWhisperer endpoint (legacy, only works in us-east-1)
+			URL:       fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+			Name:      "CodeWhisperer",
+		},
+	}
+}
+
+// kiroEndpointConfigs is kept for backward compatibility with default us-east-1 region.
+// Prefer using buildKiroEndpointConfigs(region) for dynamic region support.
+var kiroEndpointConfigs = buildKiroEndpointConfigs(kiroDefaultRegion)
+
 // getKiroEndpointConfigs returns the list of Kiro API endpoint configurations to try in order.
+// Supports dynamic region based on auth metadata "api_region", "profile_arn", or "region" field.
 // Supports reordering based on "preferred_endpoint" in auth metadata/attributes.
-// For IDC auth method, automatically uses CodeWhisperer endpoint with CLI origin.
+//
+// Region priority:
+// 1. auth.Metadata["api_region"] - explicit API region override
+// 2. ProfileARN region - extracted from arn:aws:service:REGION:account:resource
+// 3. kiroDefaultRegion (us-east-1) - fallback
+// Note: OIDC "region" is NOT used - it's for token refresh, not API calls
 func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
 	if auth == nil {
 		return kiroEndpointConfigs
 	}
 
-	// For IDC auth, use CodeWhisperer endpoint with AI_EDITOR origin (same as Social auth)
-	// Based on kiro2api analysis: IDC tokens work with CodeWhisperer endpoint using Bearer auth
+	// Determine API region with priority: api_region > profile_arn > region > default
+	region := kiroDefaultRegion
+	regionSource := "default"
+
+	if auth.Metadata != nil {
+		// Priority 1: Explicit api_region override
+		if r, ok := auth.Metadata["api_region"].(string); ok && r != "" {
+			region = r
+			regionSource = "api_region"
+		} else {
+			// Priority 2: Extract from ProfileARN
+			if profileArn, ok := auth.Metadata["profile_arn"].(string); ok && profileArn != "" {
+				if arnRegion := extractRegionFromProfileARN(profileArn); arnRegion != "" {
+					region = arnRegion
+					regionSource = "profile_arn"
+				}
+			}
+			// Note: OIDC "region" field is NOT used for API endpoint
+			// Kiro API only exists in us-east-1, while OIDC region can vary (e.g., ap-northeast-2)
+			// Using OIDC region for API calls causes DNS failures
+		}
+	}
+
+	log.Debugf("kiro: using region %s (source: %s)", region, regionSource)
+
+	// Build endpoint configs for the specified region
+	endpointConfigs := buildKiroEndpointConfigs(region)
+
+	// For IDC auth, use Q endpoint with AI_EDITOR origin
+	// IDC tokens work with Q endpoint using Bearer auth
 	// The difference is only in how tokens are refreshed (OIDC with clientId/clientSecret for IDC)
 	// NOT in how API calls are made - both Social and IDC use the same endpoint/origin
 	if auth.Metadata != nil {
 		authMethod, _ := auth.Metadata["auth_method"].(string)
-		if authMethod == "idc" {
-			log.Debugf("kiro: IDC auth, using CodeWhisperer endpoint")
-			return kiroEndpointConfigs
+		if strings.ToLower(authMethod) == "idc" {
+			log.Debugf("kiro: IDC auth, using Q endpoint (region: %s)", region)
+			return endpointConfigs
 		}
 	}
 
@@ -139,7 +456,7 @@ func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
 	}
 
 	if preference == "" {
-		return kiroEndpointConfigs
+		return endpointConfigs
 	}
 
 	preference = strings.ToLower(strings.TrimSpace(preference))
@@ -148,7 +465,7 @@ func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
 	var sorted []kiroEndpointConfig
 	var remaining []kiroEndpointConfig
 
-	for _, cfg := range kiroEndpointConfigs {
+	for _, cfg := range endpointConfigs {
 		name := strings.ToLower(cfg.Name)
 		// Check for matches
 		// CodeWhisperer aliases: codewhisperer, ide
@@ -169,7 +486,7 @@ func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
 
 	// If preference didn't match anything, return default
 	if len(sorted) == 0 {
-		return kiroEndpointConfigs
+		return endpointConfigs
 	}
 
 	// Combine: preferred first, then others
@@ -188,7 +505,7 @@ func isIDCAuth(auth *cliproxyauth.Auth) bool {
 		return false
 	}
 	authMethod, _ := auth.Metadata["auth_method"].(string)
-	return authMethod == "idc"
+	return strings.ToLower(authMethod) == "idc"
 }
 
 // buildKiroPayloadForFormat builds the Kiro API payload based on the source format.
@@ -217,8 +534,81 @@ func NewKiroExecutor(cfg *config.Config) *KiroExecutor {
 // Identifier returns the unique identifier for this executor.
 func (e *KiroExecutor) Identifier() string { return "kiro" }
 
+// applyDynamicFingerprint applies token-specific fingerprint headers to the request
+// For IDC auth, uses dynamic fingerprint-based User-Agent
+// For other auth types, uses static Amazon Q CLI style headers
+func applyDynamicFingerprint(req *http.Request, auth *cliproxyauth.Auth) {
+	if isIDCAuth(auth) {
+		// Get token-specific fingerprint for dynamic UA generation
+		tokenKey := getTokenKey(auth)
+		fp := getGlobalFingerprintManager().GetFingerprint(tokenKey)
+
+		// Use fingerprint-generated dynamic User-Agent
+		req.Header.Set("User-Agent", fp.BuildUserAgent())
+		req.Header.Set("X-Amz-User-Agent", fp.BuildAmzUserAgent())
+		req.Header.Set("x-amzn-kiro-agent-mode", kiroIDEAgentModeVibe)
+
+		log.Debugf("kiro: using dynamic fingerprint for token %s (SDK:%s, OS:%s/%s, Kiro:%s)",
+			tokenKey[:8]+"...", fp.SDKVersion, fp.OSType, fp.OSVersion, fp.KiroVersion)
+	} else {
+		// Use static Amazon Q CLI style headers for non-IDC auth
+		req.Header.Set("User-Agent", kiroUserAgent)
+		req.Header.Set("X-Amz-User-Agent", kiroFullUserAgent)
+	}
+}
+
 // PrepareRequest prepares the HTTP request before execution.
-func (e *KiroExecutor) PrepareRequest(_ *http.Request, _ *cliproxyauth.Auth) error { return nil }
+func (e *KiroExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
+	if req == nil {
+		return nil
+	}
+	accessToken, _ := kiroCredentials(auth)
+	if strings.TrimSpace(accessToken) == "" {
+		return statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
+	}
+
+	// Apply dynamic fingerprint-based headers
+	applyDynamicFingerprint(req, auth)
+
+	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
+	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(req, attrs)
+	return nil
+}
+
+// HttpRequest injects Kiro credentials into the request and executes it.
+func (e *KiroExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, fmt.Errorf("kiro executor: request is nil")
+	}
+	if ctx == nil {
+		ctx = req.Context()
+	}
+	httpReq := req.WithContext(ctx)
+	if errPrepare := e.PrepareRequest(httpReq, auth); errPrepare != nil {
+		return nil, errPrepare
+	}
+	httpClient := newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 0)
+	return httpClient.Do(httpReq)
+}
+
+// getTokenKey returns a unique key for rate limiting based on auth credentials.
+// Uses auth ID if available, otherwise falls back to a hash of the access token.
+func getTokenKey(auth *cliproxyauth.Auth) string {
+	if auth != nil && auth.ID != "" {
+		return auth.ID
+	}
+	accessToken, _ := kiroCredentials(auth)
+	if len(accessToken) > 16 {
+		return accessToken[:16]
+	}
+	return accessToken
+}
 
 // Execute sends the request to Kiro API and returns the response.
 // Supports automatic token refresh on 401/403 errors.
@@ -228,23 +618,53 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, fmt.Errorf("kiro: access token not found in auth")
 	}
 
+	// Rate limiting: get token key for tracking
+	tokenKey := getTokenKey(auth)
+	rateLimiter := kiroauth.GetGlobalRateLimiter()
+	cooldownMgr := kiroauth.GetGlobalCooldownManager()
+
+	// Check if token is in cooldown period
+	if cooldownMgr.IsInCooldown(tokenKey) {
+		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
+		reason := cooldownMgr.GetCooldownReason(tokenKey)
+		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
+		return resp, fmt.Errorf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason)
+	}
+
+	// Wait for rate limiter before proceeding
+	log.Debugf("kiro: waiting for rate limiter for token %s", tokenKey)
+	rateLimiter.WaitForToken(tokenKey)
+	log.Debugf("kiro: rate limiter cleared for token %s", tokenKey)
+
 	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
 	defer reporter.trackFailure(ctx, &err)
 
 	// Check if token is expired before making request
 	if e.isTokenExpired(accessToken) {
-		log.Infof("kiro: access token expired, attempting refresh before request")
-		refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-		if refreshErr != nil {
-			log.Warnf("kiro: pre-request token refresh failed: %v", refreshErr)
-		} else if refreshedAuth != nil {
-			auth = refreshedAuth
-			// Persist the refreshed auth to file so subsequent requests use it
-			if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-				log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-			}
+		log.Infof("kiro: access token expired, attempting recovery")
+
+		// 方案 B: 先尝试从文件重新加载 token（后台刷新器可能已更新文件）
+		reloadedAuth, reloadErr := e.reloadAuthFromFile(auth)
+		if reloadErr == nil && reloadedAuth != nil {
+			// 文件中有更新的 token，使用它
+			auth = reloadedAuth
 			accessToken, profileArn = kiroCredentials(auth)
-			log.Infof("kiro: token refreshed successfully before request")
+			log.Infof("kiro: recovered token from file (background refresh), expires_at: %v", auth.Metadata["expires_at"])
+		} else {
+			// 文件中的 token 也过期了，执行主动刷新
+			log.Debugf("kiro: file reload failed (%v), attempting active refresh", reloadErr)
+			refreshedAuth, refreshErr := e.Refresh(ctx, auth)
+			if refreshErr != nil {
+				log.Warnf("kiro: pre-request token refresh failed: %v", refreshErr)
+			} else if refreshedAuth != nil {
+				auth = refreshedAuth
+				// Persist the refreshed auth to file so subsequent requests use it
+				if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
+					log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
+				}
+				accessToken, profileArn = kiroCredentials(auth)
+				log.Infof("kiro: token refreshed successfully before request")
+			}
 		}
 	}
 
@@ -260,7 +680,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	// Execute with retry on 401/403 and 429 (quota exhausted)
 	// Note: currentOrigin and kiroPayload are built inside executeWithRetry for each endpoint
-	resp, err = e.executeWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, to, reporter, "", kiroModelID, isAgentic, isChatOnly)
+	resp, err = e.executeWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, to, reporter, "", kiroModelID, isAgentic, isChatOnly, tokenKey)
 	return resp, err
 }
 
@@ -269,9 +689,12 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 // - Amazon Q endpoint (CLI origin) uses Amazon Q Developer quota
 // - CodeWhisperer endpoint (AI_EDITOR origin) uses Kiro IDE quota
 // Also supports multi-endpoint fallback similar to Antigravity implementation.
-func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from, to sdktranslator.Format, reporter *usageReporter, currentOrigin, kiroModelID string, isAgentic, isChatOnly bool) (cliproxyexecutor.Response, error) {
+// tokenKey is used for rate limiting and cooldown tracking.
+func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from, to sdktranslator.Format, reporter *usageReporter, currentOrigin, kiroModelID string, isAgentic, isChatOnly bool, tokenKey string) (cliproxyexecutor.Response, error) {
 	var resp cliproxyexecutor.Response
 	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
+	rateLimiter := kiroauth.GetGlobalRateLimiter()
+	cooldownMgr := kiroauth.GetGlobalCooldownManager()
 	endpointConfigs := getKiroEndpointConfigs(auth)
 	var last429Err error
 
@@ -289,6 +712,12 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			endpointIdx+1, len(endpointConfigs), url, endpointConfig.Name, currentOrigin)
 
 		for attempt := 0; attempt <= maxRetries; attempt++ {
+			// Apply human-like delay before first request (not on retries)
+			// This mimics natural user behavior patterns
+			if attempt == 0 && endpointIdx == 0 {
+				kiroauth.ApplyHumanLikeDelay()
+			}
+
 			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(kiroPayload))
 			if err != nil {
 				return resp, err
@@ -296,21 +725,17 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 			httpReq.Header.Set("Content-Type", kiroContentType)
 			httpReq.Header.Set("Accept", kiroAcceptStream)
-			// Use endpoint-specific X-Amz-Target (critical for avoiding 403 errors)
-			httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)
-
-			// Use different headers based on auth type
-			// IDC auth uses Kiro IDE style headers (from kiro2api)
-			// Other auth types use Amazon Q CLI style headers
-			if isIDCAuth(auth) {
-				httpReq.Header.Set("User-Agent", kiroIDEUserAgent)
-				httpReq.Header.Set("X-Amz-User-Agent", kiroIDEAmzUserAgent)
-				httpReq.Header.Set("x-amzn-kiro-agent-mode", kiroIDEAgentModeSpec)
-				log.Debugf("kiro: using Kiro IDE headers for IDC auth")
-			} else {
-				httpReq.Header.Set("User-Agent", kiroUserAgent)
-				httpReq.Header.Set("X-Amz-User-Agent", kiroFullUserAgent)
+			// Only set X-Amz-Target if specified (Q endpoint doesn't require it)
+			if endpointConfig.AmzTarget != "" {
+				httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)
 			}
+			// Kiro-specific headers
+			httpReq.Header.Set("x-amzn-kiro-agent-mode", kiroIDEAgentModeVibe)
+			httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
+
+			// Apply dynamic fingerprint-based headers
+			applyDynamicFingerprint(httpReq, auth)
+
 			httpReq.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 			httpReq.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
@@ -341,10 +766,34 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				AuthValue: authValue,
 			})
 
-			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 120*time.Second)
+			httpClient := newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 120*time.Second)
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
+				// Check for context cancellation first - client disconnected, not a server error
+				// Use 499 (Client Closed Request - nginx convention) instead of 500
+				if errors.Is(err, context.Canceled) {
+					log.Debugf("kiro: request canceled by client (context.Canceled)")
+					return resp, statusErr{code: 499, msg: "client canceled request"}
+				}
+
+				// Check for context deadline exceeded - request timed out
+				// Return 504 Gateway Timeout instead of 500
+				if errors.Is(err, context.DeadlineExceeded) {
+					log.Debugf("kiro: request timed out (context.DeadlineExceeded)")
+					return resp, statusErr{code: http.StatusGatewayTimeout, msg: "upstream request timed out"}
+				}
+
 				recordAPIResponseError(ctx, e.cfg, err)
+
+				// Enhanced socket retry: Check if error is retryable (network timeout, connection reset, etc.)
+				retryCfg := defaultRetryConfig()
+				if isRetryableError(err) && attempt < retryCfg.MaxRetries {
+					delay := calculateRetryDelay(attempt, retryCfg)
+					logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("socket error: %v", err), delay, endpointConfig.Name)
+					time.Sleep(delay)
+					continue
+				}
+
 				return resp, err
 			}
 			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
@@ -355,6 +804,12 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
+
+				// Record failure and set cooldown for 429
+				rateLimiter.MarkTokenFailed(tokenKey)
+				cooldownDuration := kiroauth.CalculateCooldownFor429(attempt)
+				cooldownMgr.SetCooldown(tokenKey, cooldownDuration, kiroauth.CooldownReason429)
+				log.Warnf("kiro: rate limit hit (429), token %s set to cooldown for %v", tokenKey, cooldownDuration)
 
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
 				last429Err = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
@@ -367,13 +822,21 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			}
 
 			// Handle 5xx server errors with exponential backoff retry
+			// Enhanced: Use retryConfig for consistent retry behavior
 			if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
 
-				if attempt < maxRetries {
-					// Exponential backoff: 1s, 2s, 4s... (max 30s)
+				retryCfg := defaultRetryConfig()
+				// Check if this specific 5xx code is retryable (502, 503, 504)
+				if isRetryableHTTPStatus(httpResp.StatusCode) && attempt < retryCfg.MaxRetries {
+					delay := calculateRetryDelay(attempt, retryCfg)
+					logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("HTTP %d", httpResp.StatusCode), delay, endpointConfig.Name)
+					time.Sleep(delay)
+					continue
+				} else if attempt < maxRetries {
+					// Fallback for other 5xx errors (500, 501, etc.)
 					backoff := time.Duration(1<<attempt) * time.Second
 					if backoff > 30*time.Second {
 						backoff = 30 * time.Second
@@ -393,28 +856,28 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
 
-				if attempt < maxRetries {
-					log.Warnf("kiro: received 401 error, attempting token refresh and retry (attempt %d/%d)", attempt+1, maxRetries+1)
+				log.Warnf("kiro: received 401 error, attempting token refresh")
+				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
+				if refreshErr != nil {
+					log.Errorf("kiro: token refresh failed: %v", refreshErr)
+					return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				}
 
-					refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-					if refreshErr != nil {
-						log.Errorf("kiro: token refresh failed: %v", refreshErr)
-						return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				if refreshedAuth != nil {
+					auth = refreshedAuth
+					// Persist the refreshed auth to file so subsequent requests use it
+					if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
+						log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
+						// Continue anyway - the token is valid for this request
 					}
-
-					if refreshedAuth != nil {
-						auth = refreshedAuth
-						// Persist the refreshed auth to file so subsequent requests use it
-						if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-							log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-							// Continue anyway - the token is valid for this request
-						}
-						accessToken, profileArn = kiroCredentials(auth)
-						// Rebuild payload with new profile ARN if changed
-						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, isAgentic, isChatOnly, from, opts.Headers)
-						log.Infof("kiro: token refreshed successfully, retrying request")
+					accessToken, profileArn = kiroCredentials(auth)
+					// Rebuild payload with new profile ARN if changed
+					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, isAgentic, isChatOnly, from, opts.Headers)
+					if attempt < maxRetries {
+						log.Infof("kiro: token refreshed successfully, retrying request (attempt %d/%d)", attempt+1, maxRetries+1)
 						continue
 					}
+					log.Infof("kiro: token refreshed successfully, no retries remaining")
 				}
 
 				log.Warnf("kiro request error, status: 401, body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
@@ -447,7 +910,10 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 				// Check for SUSPENDED status - return immediately without retry
 				if strings.Contains(respBodyStr, "SUSPENDED") || strings.Contains(respBodyStr, "TEMPORARILY_SUSPENDED") {
-					log.Errorf("kiro: account is suspended, cannot proceed")
+					// Set long cooldown for suspended accounts
+					rateLimiter.CheckAndMarkSuspended(tokenKey, respBodyStr)
+					cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
+					log.Errorf("kiro: account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
 					return resp, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + string(respBody)}
 				}
 
@@ -509,32 +975,42 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			}
 
 			// Fallback for usage if missing from upstream
-			if usageInfo.TotalTokens == 0 {
+
+			// 1. Estimate InputTokens if missing
+			if usageInfo.InputTokens == 0 {
 				if enc, encErr := getTokenizer(req.Model); encErr == nil {
 					if inp, countErr := countOpenAIChatTokens(enc, opts.OriginalRequest); countErr == nil {
 						usageInfo.InputTokens = inp
 					}
 				}
-				if len(content) > 0 {
-					// Use tiktoken for more accurate output token calculation
-					if enc, encErr := getTokenizer(req.Model); encErr == nil {
-						if tokenCount, countErr := enc.Count(content); countErr == nil {
-							usageInfo.OutputTokens = int64(tokenCount)
-						}
-					}
-					// Fallback to character count estimation if tiktoken fails
-					if usageInfo.OutputTokens == 0 {
-						usageInfo.OutputTokens = int64(len(content) / 4)
-						if usageInfo.OutputTokens == 0 {
-							usageInfo.OutputTokens = 1
-						}
+			}
+
+			// 2. Estimate OutputTokens if missing and content is available
+			if usageInfo.OutputTokens == 0 && len(content) > 0 {
+				// Use tiktoken for more accurate output token calculation
+				if enc, encErr := getTokenizer(req.Model); encErr == nil {
+					if tokenCount, countErr := enc.Count(content); countErr == nil {
+						usageInfo.OutputTokens = int64(tokenCount)
 					}
 				}
-				usageInfo.TotalTokens = usageInfo.InputTokens + usageInfo.OutputTokens
+				// Fallback to character count estimation if tiktoken fails
+				if usageInfo.OutputTokens == 0 {
+					usageInfo.OutputTokens = int64(len(content) / 4)
+					if usageInfo.OutputTokens == 0 {
+						usageInfo.OutputTokens = 1
+					}
+				}
 			}
+
+			// 3. Update TotalTokens
+			usageInfo.TotalTokens = usageInfo.InputTokens + usageInfo.OutputTokens
 
 			appendAPIResponseChunk(ctx, e.cfg, []byte(content))
 			reporter.publish(ctx, usageInfo)
+
+			// Record success for rate limiting
+			rateLimiter.MarkTokenSuccess(tokenKey)
+			log.Debugf("kiro: request successful, token %s marked as success", tokenKey)
 
 			// Build response in Claude format for Kiro translator
 			// stopReason is extracted from upstream response by parseEventStream
@@ -563,23 +1039,53 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, fmt.Errorf("kiro: access token not found in auth")
 	}
 
+	// Rate limiting: get token key for tracking
+	tokenKey := getTokenKey(auth)
+	rateLimiter := kiroauth.GetGlobalRateLimiter()
+	cooldownMgr := kiroauth.GetGlobalCooldownManager()
+
+	// Check if token is in cooldown period
+	if cooldownMgr.IsInCooldown(tokenKey) {
+		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
+		reason := cooldownMgr.GetCooldownReason(tokenKey)
+		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
+		return nil, fmt.Errorf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason)
+	}
+
+	// Wait for rate limiter before proceeding
+	log.Debugf("kiro: stream waiting for rate limiter for token %s", tokenKey)
+	rateLimiter.WaitForToken(tokenKey)
+	log.Debugf("kiro: stream rate limiter cleared for token %s", tokenKey)
+
 	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
 	defer reporter.trackFailure(ctx, &err)
 
 	// Check if token is expired before making request
 	if e.isTokenExpired(accessToken) {
-		log.Infof("kiro: access token expired, attempting refresh before stream request")
-		refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-		if refreshErr != nil {
-			log.Warnf("kiro: pre-request token refresh failed: %v", refreshErr)
-		} else if refreshedAuth != nil {
-			auth = refreshedAuth
-			// Persist the refreshed auth to file so subsequent requests use it
-			if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-				log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-			}
+		log.Infof("kiro: access token expired, attempting recovery before stream request")
+
+		// 方案 B: 先尝试从文件重新加载 token（后台刷新器可能已更新文件）
+		reloadedAuth, reloadErr := e.reloadAuthFromFile(auth)
+		if reloadErr == nil && reloadedAuth != nil {
+			// 文件中有更新的 token，使用它
+			auth = reloadedAuth
 			accessToken, profileArn = kiroCredentials(auth)
-			log.Infof("kiro: token refreshed successfully before stream request")
+			log.Infof("kiro: recovered token from file (background refresh) for stream, expires_at: %v", auth.Metadata["expires_at"])
+		} else {
+			// 文件中的 token 也过期了，执行主动刷新
+			log.Debugf("kiro: file reload failed (%v), attempting active refresh for stream", reloadErr)
+			refreshedAuth, refreshErr := e.Refresh(ctx, auth)
+			if refreshErr != nil {
+				log.Warnf("kiro: pre-request token refresh failed: %v", refreshErr)
+			} else if refreshedAuth != nil {
+				auth = refreshedAuth
+				// Persist the refreshed auth to file so subsequent requests use it
+				if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
+					log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
+				}
+				accessToken, profileArn = kiroCredentials(auth)
+				log.Infof("kiro: token refreshed successfully before stream request")
+			}
 		}
 	}
 
@@ -595,7 +1101,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 	// Execute stream with retry on 401/403 and 429 (quota exhausted)
 	// Note: currentOrigin and kiroPayload are built inside executeStreamWithRetry for each endpoint
-	return e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, reporter, "", kiroModelID, isAgentic, isChatOnly)
+	return e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, reporter, "", kiroModelID, isAgentic, isChatOnly, tokenKey)
 }
 
 // executeStreamWithRetry performs the streaming HTTP request with automatic retry on auth errors.
@@ -603,8 +1109,11 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 // - Amazon Q endpoint (CLI origin) uses Amazon Q Developer quota
 // - CodeWhisperer endpoint (AI_EDITOR origin) uses Kiro IDE quota
 // Also supports multi-endpoint fallback similar to Antigravity implementation.
-func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from sdktranslator.Format, reporter *usageReporter, currentOrigin, kiroModelID string, isAgentic, isChatOnly bool) (<-chan cliproxyexecutor.StreamChunk, error) {
+// tokenKey is used for rate limiting and cooldown tracking.
+func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from sdktranslator.Format, reporter *usageReporter, currentOrigin, kiroModelID string, isAgentic, isChatOnly bool, tokenKey string) (<-chan cliproxyexecutor.StreamChunk, error) {
 	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
+	rateLimiter := kiroauth.GetGlobalRateLimiter()
+	cooldownMgr := kiroauth.GetGlobalCooldownManager()
 	endpointConfigs := getKiroEndpointConfigs(auth)
 	var last429Err error
 
@@ -622,6 +1131,13 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			endpointIdx+1, len(endpointConfigs), url, endpointConfig.Name, currentOrigin)
 
 		for attempt := 0; attempt <= maxRetries; attempt++ {
+			// Apply human-like delay before first streaming request (not on retries)
+			// This mimics natural user behavior patterns
+			// Note: Delay is NOT applied during streaming response - only before initial request
+			if attempt == 0 && endpointIdx == 0 {
+				kiroauth.ApplyHumanLikeDelay()
+			}
+
 			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(kiroPayload))
 			if err != nil {
 				return nil, err
@@ -629,21 +1145,17 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 			httpReq.Header.Set("Content-Type", kiroContentType)
 			httpReq.Header.Set("Accept", kiroAcceptStream)
-			// Use endpoint-specific X-Amz-Target (critical for avoiding 403 errors)
-			httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)
-
-			// Use different headers based on auth type
-			// IDC auth uses Kiro IDE style headers (from kiro2api)
-			// Other auth types use Amazon Q CLI style headers
-			if isIDCAuth(auth) {
-				httpReq.Header.Set("User-Agent", kiroIDEUserAgent)
-				httpReq.Header.Set("X-Amz-User-Agent", kiroIDEAmzUserAgent)
-				httpReq.Header.Set("x-amzn-kiro-agent-mode", kiroIDEAgentModeSpec)
-				log.Debugf("kiro: using Kiro IDE headers for IDC auth")
-			} else {
-				httpReq.Header.Set("User-Agent", kiroUserAgent)
-				httpReq.Header.Set("X-Amz-User-Agent", kiroFullUserAgent)
+			// Only set X-Amz-Target if specified (Q endpoint doesn't require it)
+			if endpointConfig.AmzTarget != "" {
+				httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)
 			}
+			// Kiro-specific headers
+			httpReq.Header.Set("x-amzn-kiro-agent-mode", kiroIDEAgentModeVibe)
+			httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
+
+			// Apply dynamic fingerprint-based headers
+			applyDynamicFingerprint(httpReq, auth)
+
 			httpReq.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 			httpReq.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
@@ -674,10 +1186,20 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				AuthValue: authValue,
 			})
 
-			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+			httpClient := newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 0)
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
 				recordAPIResponseError(ctx, e.cfg, err)
+
+				// Enhanced socket retry for streaming: Check if error is retryable (network timeout, connection reset, etc.)
+				retryCfg := defaultRetryConfig()
+				if isRetryableError(err) && attempt < retryCfg.MaxRetries {
+					delay := calculateRetryDelay(attempt, retryCfg)
+					logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("stream socket error: %v", err), delay, endpointConfig.Name)
+					time.Sleep(delay)
+					continue
+				}
+
 				return nil, err
 			}
 			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
@@ -688,6 +1210,12 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
+
+				// Record failure and set cooldown for 429
+				rateLimiter.MarkTokenFailed(tokenKey)
+				cooldownDuration := kiroauth.CalculateCooldownFor429(attempt)
+				cooldownMgr.SetCooldown(tokenKey, cooldownDuration, kiroauth.CooldownReason429)
+				log.Warnf("kiro: stream rate limit hit (429), token %s set to cooldown for %v", tokenKey, cooldownDuration)
 
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
 				last429Err = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
@@ -700,13 +1228,21 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			}
 
 			// Handle 5xx server errors with exponential backoff retry
+			// Enhanced: Use retryConfig for consistent retry behavior
 			if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
 
-				if attempt < maxRetries {
-					// Exponential backoff: 1s, 2s, 4s... (max 30s)
+				retryCfg := defaultRetryConfig()
+				// Check if this specific 5xx code is retryable (502, 503, 504)
+				if isRetryableHTTPStatus(httpResp.StatusCode) && attempt < retryCfg.MaxRetries {
+					delay := calculateRetryDelay(attempt, retryCfg)
+					logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("stream HTTP %d", httpResp.StatusCode), delay, endpointConfig.Name)
+					time.Sleep(delay)
+					continue
+				} else if attempt < maxRetries {
+					// Fallback for other 5xx errors (500, 501, etc.)
 					backoff := time.Duration(1<<attempt) * time.Second
 					if backoff > 30*time.Second {
 						backoff = 30 * time.Second
@@ -739,28 +1275,28 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
 
-				if attempt < maxRetries {
-					log.Warnf("kiro: stream received 401 error, attempting token refresh and retry (attempt %d/%d)", attempt+1, maxRetries+1)
+				log.Warnf("kiro: stream received 401 error, attempting token refresh")
+				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
+				if refreshErr != nil {
+					log.Errorf("kiro: token refresh failed: %v", refreshErr)
+					return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				}
 
-					refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-					if refreshErr != nil {
-						log.Errorf("kiro: token refresh failed: %v", refreshErr)
-						return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				if refreshedAuth != nil {
+					auth = refreshedAuth
+					// Persist the refreshed auth to file so subsequent requests use it
+					if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
+						log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
+						// Continue anyway - the token is valid for this request
 					}
-
-					if refreshedAuth != nil {
-						auth = refreshedAuth
-						// Persist the refreshed auth to file so subsequent requests use it
-						if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-							log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-							// Continue anyway - the token is valid for this request
-						}
-						accessToken, profileArn = kiroCredentials(auth)
-						// Rebuild payload with new profile ARN if changed
-						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, isAgentic, isChatOnly, from, opts.Headers)
-						log.Infof("kiro: token refreshed successfully, retrying stream request")
+					accessToken, profileArn = kiroCredentials(auth)
+					// Rebuild payload with new profile ARN if changed
+					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, isAgentic, isChatOnly, from, opts.Headers)
+					if attempt < maxRetries {
+						log.Infof("kiro: token refreshed successfully, retrying stream request (attempt %d/%d)", attempt+1, maxRetries+1)
 						continue
 					}
+					log.Infof("kiro: token refreshed successfully, no retries remaining")
 				}
 
 				log.Warnf("kiro stream error, status: 401, body: %s", string(respBody))
@@ -793,7 +1329,10 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 				// Check for SUSPENDED status - return immediately without retry
 				if strings.Contains(respBodyStr, "SUSPENDED") || strings.Contains(respBodyStr, "TEMPORARILY_SUSPENDED") {
-					log.Errorf("kiro: account is suspended, cannot proceed")
+					// Set long cooldown for suspended accounts
+					rateLimiter.CheckAndMarkSuspended(tokenKey, respBodyStr)
+					cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
+					log.Errorf("kiro: stream account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
 					return nil, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + string(respBody)}
 				}
 
@@ -842,6 +1381,11 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			}
 
 			out := make(chan cliproxyexecutor.StreamChunk)
+
+			// Record success immediately since connection was established successfully
+			// Streaming errors will be handled separately
+			rateLimiter.MarkTokenSuccess(tokenKey)
+			log.Debugf("kiro: stream request successful, token %s marked as success", tokenKey)
 
 			go func(resp *http.Response, thinkingEnabled bool) {
 				defer close(out)
@@ -1004,7 +1548,7 @@ func findRealThinkingEndTag(content string, alreadyInCodeBlock, alreadyInInlineC
 		discussionPatterns := []string{
 			"标签", "返回", "输出", "包含", "使用", "解析", "转换", "生成", // Chinese
 			"tag", "return", "output", "contain", "use", "parse", "emit", "convert", "generate", // English
-			"<thinking>", // discussing both tags together
+			"<thinking>",    // discussing both tags together
 			"`</thinking>`", // explicitly in inline code
 		}
 		isDiscussion := false
@@ -1069,11 +1613,27 @@ func determineAgenticMode(model string) (isAgentic, isChatOnly bool) {
 }
 
 // getEffectiveProfileArn determines if profileArn should be included based on auth method.
-// profileArn is only needed for social auth (Google OAuth), not for builder-id (AWS SSO).
+// profileArn is only needed for social auth (Google OAuth), not for AWS SSO OIDC (Builder ID/IDC).
+//
+// Detection logic (matching kiro-openai-gateway):
+// 1. Check auth_method field: "builder-id" or "idc"
+// 2. Check auth_type field: "aws_sso_oidc" (from kiro-cli tokens)
+// 3. Check for client_id + client_secret presence (AWS SSO OIDC signature)
 func getEffectiveProfileArn(auth *cliproxyauth.Auth, profileArn string) string {
 	if auth != nil && auth.Metadata != nil {
-		if authMethod, ok := auth.Metadata["auth_method"].(string); ok && authMethod == "builder-id" {
-			return "" // Don't include profileArn for builder-id auth
+		// Check 1: auth_method field (from CLIProxyAPI tokens)
+		if authMethod, ok := auth.Metadata["auth_method"].(string); ok && (authMethod == "builder-id" || authMethod == "idc") {
+			return "" // AWS SSO OIDC - don't include profileArn
+		}
+		// Check 2: auth_type field (from kiro-cli tokens)
+		if authType, ok := auth.Metadata["auth_type"].(string); ok && authType == "aws_sso_oidc" {
+			return "" // AWS SSO OIDC - don't include profileArn
+		}
+		// Check 3: client_id + client_secret presence (AWS SSO OIDC signature)
+		_, hasClientID := auth.Metadata["client_id"].(string)
+		_, hasClientSecret := auth.Metadata["client_secret"].(string)
+		if hasClientID && hasClientSecret {
+			return "" // AWS SSO OIDC - don't include profileArn
 		}
 	}
 	return profileArn
@@ -1082,14 +1642,32 @@ func getEffectiveProfileArn(auth *cliproxyauth.Auth, profileArn string) string {
 // getEffectiveProfileArnWithWarning determines if profileArn should be included based on auth method,
 // and logs a warning if profileArn is missing for non-builder-id auth.
 // This consolidates the auth_method check that was previously done separately.
+//
+// AWS SSO OIDC (Builder ID/IDC) users don't need profileArn - sending it causes 403 errors.
+// Only Kiro Desktop (social auth like Google/GitHub) users need profileArn.
+//
+// Detection logic (matching kiro-openai-gateway):
+// 1. Check auth_method field: "builder-id" or "idc"
+// 2. Check auth_type field: "aws_sso_oidc" (from kiro-cli tokens)
+// 3. Check for client_id + client_secret presence (AWS SSO OIDC signature)
 func getEffectiveProfileArnWithWarning(auth *cliproxyauth.Auth, profileArn string) string {
 	if auth != nil && auth.Metadata != nil {
+		// Check 1: auth_method field (from CLIProxyAPI tokens)
 		if authMethod, ok := auth.Metadata["auth_method"].(string); ok && (authMethod == "builder-id" || authMethod == "idc") {
-			// builder-id and idc auth don't need profileArn
-			return ""
+			return "" // AWS SSO OIDC - don't include profileArn
+		}
+		// Check 2: auth_type field (from kiro-cli tokens)
+		if authType, ok := auth.Metadata["auth_type"].(string); ok && authType == "aws_sso_oidc" {
+			return "" // AWS SSO OIDC - don't include profileArn
+		}
+		// Check 3: client_id + client_secret presence (AWS SSO OIDC signature, like kiro-openai-gateway)
+		_, hasClientID := auth.Metadata["client_id"].(string)
+		_, hasClientSecret := auth.Metadata["client_secret"].(string)
+		if hasClientID && hasClientSecret {
+			return "" // AWS SSO OIDC - don't include profileArn
 		}
 	}
-	// For non-builder-id/idc auth (social auth), profileArn is required
+	// For social auth (Kiro Desktop), profileArn is required
 	if profileArn == "" {
 		log.Warnf("kiro: profile ARN not found in auth, API calls may fail")
 	}
@@ -1852,7 +2430,6 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 	return ""
 }
 
-
 // NOTE: Response building functions moved to internal/translator/kiro/claude/kiro_claude_response.go
 // The executor now uses kiroclaude.BuildClaudeResponse() and kiroclaude.ExtractThinkingFromContent() instead
 
@@ -1865,8 +2442,8 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte, reporter *usageReporter, thinkingEnabled bool) {
 	reader := bufio.NewReaderSize(body, 20*1024*1024) // 20MB buffer to match other providers
 	var totalUsage usage.Detail
-	var hasToolUses bool          // Track if any tool uses were emitted
-	var upstreamStopReason string // Track stop_reason from upstream events
+	var hasToolUses bool              // Track if any tool uses were emitted
+	var upstreamStopReason string     // Track stop_reason from upstream events
 
 	// Tool use state tracking for input buffering and deduplication
 	processedIDs := make(map[string]bool)
@@ -1889,18 +2466,18 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	var lastReportedOutputTokens int64   // Last reported output token count
 
 	// Upstream usage tracking - Kiro API returns credit usage and context percentage
-	var upstreamCreditUsage float64        // Credit usage from upstream (e.g., 1.458)
-	var upstreamContextPercentage float64  // Context usage percentage from upstream (e.g., 78.56)
-	var hasUpstreamUsage bool              // Whether we received usage from upstream
+	var upstreamCreditUsage float64       // Credit usage from upstream (e.g., 1.458)
+	var upstreamContextPercentage float64 // Context usage percentage from upstream (e.g., 78.56)
+	var hasUpstreamUsage bool             // Whether we received usage from upstream
 
 	// Translator param for maintaining tool call state across streaming events
 	// IMPORTANT: This must persist across all TranslateStream calls
 	var translatorParam any
 
 	// Thinking mode state tracking - tag-based parsing for <thinking> tags in content
-	inThinkBlock := false       // Whether we're currently inside a <thinking> block
-	isThinkingBlockOpen := false // Track if thinking content block SSE event is open
-	thinkingBlockIndex := -1     // Index of the thinking content block
+	inThinkBlock := false                          // Whether we're currently inside a <thinking> block
+	isThinkingBlockOpen := false                   // Track if thinking content block SSE event is open
+	thinkingBlockIndex := -1                       // Index of the thinking content block
 	var accumulatedThinkingContent strings.Builder // Accumulate thinking content for token counting
 
 	// Buffer for handling partial tag matches at chunk boundaries
@@ -2319,16 +2896,16 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 					lastUsageUpdateLen = accumulatedContent.Len()
 					lastUsageUpdateTime = time.Now()
-					}
+				}
 
-					// TAG-BASED THINKING PARSING: Parse <thinking> tags from content
-					// Combine pending content with new content for processing
-					pendingContent.WriteString(contentDelta)
-					processContent := pendingContent.String()
-					pendingContent.Reset()
+				// TAG-BASED THINKING PARSING: Parse <thinking> tags from content
+				// Combine pending content with new content for processing
+				pendingContent.WriteString(contentDelta)
+				processContent := pendingContent.String()
+				pendingContent.Reset()
 
-					// Process content looking for thinking tags
-					for len(processContent) > 0 {
+				// Process content looking for thinking tags
+				for len(processContent) > 0 {
 					if inThinkBlock {
 						// We're inside a thinking block, look for </thinking>
 						endIdx := strings.Index(processContent, kirocommon.ThinkingEndTag)
@@ -2503,7 +3080,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 							processContent = ""
 						}
 					}
-					}
+				}
 			}
 
 			// Handle tool uses in response (with deduplication)
@@ -2644,12 +3221,92 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			_ = signature // Signature can be used for verification if needed
 
 		case "toolUseEvent":
+			// Debug: log raw toolUseEvent payload for large tool inputs
+			if log.IsLevelEnabled(log.DebugLevel) {
+				payloadStr := string(payload)
+				if len(payloadStr) > 500 {
+					payloadStr = payloadStr[:500] + "...[truncated]"
+				}
+				log.Debugf("kiro: raw toolUseEvent payload (%d bytes): %s", len(payload), payloadStr)
+			}
 			// Handle dedicated tool use events with input buffering
 			completedToolUses, newState := kiroclaude.ProcessToolUseEvent(event, currentToolUse, processedIDs)
 			currentToolUse = newState
 
 			// Emit completed tool uses
 			for _, tu := range completedToolUses {
+				// Check for truncated write marker - emit as a Bash tool that echoes the error
+				// This way Claude Code will execute it, see the error, and the agent can retry
+				if tu.Name == "__truncated_write__" {
+					filePath := ""
+					if fp, ok := tu.Input["file_path"].(string); ok && fp != "" {
+						filePath = fp
+					}
+
+					// Create a Bash tool that echoes the error message
+					// This will be executed by Claude Code and the agent will see the result
+					var errorMsg string
+					if filePath != "" {
+						errorMsg = fmt.Sprintf("echo '[WRITE TOOL ERROR] The file content for \"%s\" is too large to be transmitted by the upstream API. You MUST retry by writing the file in smaller chunks: First use Write to create the file with the first 700 lines, then use multiple Edit operations to append the remaining content in chunks of ~700 lines each.'", filePath)
+					} else {
+						errorMsg = "echo '[WRITE TOOL ERROR] The file content is too large to be transmitted by the upstream API. The Write tool input was truncated. You MUST retry by writing the file in smaller chunks: First use Write to create the file with the first 700 lines, then use multiple Edit operations to append the remaining content in chunks of ~700 lines each.'"
+					}
+
+					log.Warnf("kiro: converting truncated write to Bash echo for file: %s", filePath)
+
+					hasToolUses = true
+
+					// Close text block if open
+					if isTextBlockOpen && contentBlockIndex >= 0 {
+						blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
+						sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
+						for _, chunk := range sseData {
+							if chunk != "" {
+								out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+							}
+						}
+						isTextBlockOpen = false
+					}
+
+					contentBlockIndex++
+
+					// Emit as Bash tool_use
+					blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", tu.ToolUseID, "Bash")
+					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
+					for _, chunk := range sseData {
+						if chunk != "" {
+							out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+						}
+					}
+
+					// Emit the Bash command as input
+					bashInput := map[string]interface{}{
+						"command": errorMsg,
+					}
+					inputJSON, err := json.Marshal(bashInput)
+					if err != nil {
+						log.Errorf("kiro: failed to marshal bash input for truncated write error: %v", err)
+						continue
+					}
+					inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(string(inputJSON), contentBlockIndex)
+					sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, inputDelta, &translatorParam)
+					for _, chunk := range sseData {
+						if chunk != "" {
+							out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+						}
+					}
+
+					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
+					sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
+					for _, chunk := range sseData {
+						if chunk != "" {
+							out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+						}
+					}
+
+					continue // Skip the normal tool_use emission
+				}
+
 				hasToolUses = true
 
 				// Close text block if open
@@ -2927,7 +3584,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 		// Calculate input tokens from context percentage
 		// Using 200k as the base since that's what Kiro reports against
 		calculatedInputTokens := int64(upstreamContextPercentage * 200000 / 100)
-		
+
 		// Only use calculated value if it's significantly different from local estimate
 		// This provides more accurate token counts based on upstream data
 		if calculatedInputTokens > 0 {
@@ -3070,14 +3727,14 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 		// Also check if expires_at is now in the future with sufficient buffer
 		if expiresAt, ok := auth.Metadata["expires_at"].(string); ok {
 			if expTime, err := time.Parse(time.RFC3339, expiresAt); err == nil {
-				// If token expires more than 5 minutes from now, it's still valid
-				if time.Until(expTime) > 5*time.Minute {
+				// If token expires more than 20 minutes from now, it's still valid
+				if time.Until(expTime) > 20*time.Minute {
 					log.Debugf("kiro executor: token is still valid (expires in %v), skipping refresh", time.Until(expTime))
 					// CRITICAL FIX: Set NextRefreshAfter to prevent frequent refresh checks
-					// Without this, shouldRefresh() will return true again in 5 seconds
+					// Without this, shouldRefresh() will return true again in 30 seconds
 					updated := auth.Clone()
-					// Set next refresh to 5 minutes before expiry, or at least 30 seconds from now
-					nextRefresh := expTime.Add(-5 * time.Minute)
+					// Set next refresh to 20 minutes before expiry, or at least 30 seconds from now
+					nextRefresh := expTime.Add(-20 * time.Minute)
 					minNextRefresh := time.Now().Add(30 * time.Second)
 					if nextRefresh.Before(minNextRefresh) {
 						nextRefresh = minNextRefresh
@@ -3174,6 +3831,13 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 	if tokenData.ClientSecret != "" {
 		updated.Metadata["client_secret"] = tokenData.ClientSecret
 	}
+	// Preserve region and start_url for IDC token refresh
+	if tokenData.Region != "" {
+		updated.Metadata["region"] = tokenData.Region
+	}
+	if tokenData.StartURL != "" {
+		updated.Metadata["start_url"] = tokenData.StartURL
+	}
 
 	if updated.Attributes == nil {
 		updated.Attributes = make(map[string]string)
@@ -3183,9 +3847,9 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 		updated.Attributes["profile_arn"] = tokenData.ProfileArn
 	}
 
-	// NextRefreshAfter is aligned with RefreshLead (5min)
+	// NextRefreshAfter is aligned with RefreshLead (20min)
 	if expiresAt, parseErr := time.Parse(time.RFC3339, tokenData.ExpiresAt); parseErr == nil {
-		updated.NextRefreshAfter = expiresAt.Add(-5 * time.Minute)
+		updated.NextRefreshAfter = expiresAt.Add(-20 * time.Minute)
 	}
 
 	log.Infof("kiro executor: token refreshed successfully, expires at %s", tokenData.ExpiresAt)
@@ -3237,6 +3901,121 @@ func (e *KiroExecutor) persistRefreshedAuth(auth *cliproxyauth.Auth) error {
 
 	log.Debugf("kiro executor: persisted refreshed auth to %s", authPath)
 	return nil
+}
+
+// reloadAuthFromFile 从文件重新加载 auth 数据（方案 B: Fallback 机制）
+// 当内存中的 token 已过期时，尝试从文件读取最新的 token
+// 这解决了后台刷新器已更新文件但内存中 Auth 对象尚未同步的时间差问题
+func (e *KiroExecutor) reloadAuthFromFile(auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	if auth == nil {
+		return nil, fmt.Errorf("kiro executor: cannot reload nil auth")
+	}
+
+	// 确定文件路径
+	var authPath string
+	if auth.Attributes != nil {
+		if p := strings.TrimSpace(auth.Attributes["path"]); p != "" {
+			authPath = p
+		}
+	}
+	if authPath == "" {
+		fileName := strings.TrimSpace(auth.FileName)
+		if fileName == "" {
+			return nil, fmt.Errorf("kiro executor: auth has no file path or filename for reload")
+		}
+		if filepath.IsAbs(fileName) {
+			authPath = fileName
+		} else if e.cfg != nil && e.cfg.AuthDir != "" {
+			authPath = filepath.Join(e.cfg.AuthDir, fileName)
+		} else {
+			return nil, fmt.Errorf("kiro executor: cannot determine auth file path for reload")
+		}
+	}
+
+	// 读取文件
+	raw, err := os.ReadFile(authPath)
+	if err != nil {
+		return nil, fmt.Errorf("kiro executor: failed to read auth file %s: %w", authPath, err)
+	}
+
+	// 解析 JSON
+	var metadata map[string]any
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		return nil, fmt.Errorf("kiro executor: failed to parse auth file %s: %w", authPath, err)
+	}
+
+	// 检查文件中的 token 是否比内存中的更新
+	fileExpiresAt, _ := metadata["expires_at"].(string)
+	fileAccessToken, _ := metadata["access_token"].(string)
+	memExpiresAt, _ := auth.Metadata["expires_at"].(string)
+	memAccessToken, _ := auth.Metadata["access_token"].(string)
+
+	// 文件中必须有有效的 access_token
+	if fileAccessToken == "" {
+		return nil, fmt.Errorf("kiro executor: auth file has no access_token field")
+	}
+
+	// 如果有 expires_at，检查是否过期
+	if fileExpiresAt != "" {
+		fileExpTime, parseErr := time.Parse(time.RFC3339, fileExpiresAt)
+		if parseErr == nil {
+			// 如果文件中的 token 也已过期，不使用它
+			if time.Now().After(fileExpTime) {
+				log.Debugf("kiro executor: file token also expired at %s, not using", fileExpiresAt)
+				return nil, fmt.Errorf("kiro executor: file token also expired")
+			}
+		}
+	}
+
+	// 判断文件中的 token 是否比内存中的更新
+	// 条件1: access_token 不同（说明已刷新）
+	// 条件2: expires_at 更新（说明已刷新）
+	isNewer := false
+
+	// 优先检查 access_token 是否变化
+	if fileAccessToken != memAccessToken {
+		isNewer = true
+		log.Debugf("kiro executor: file access_token differs from memory, using file token")
+	}
+
+	// 如果 access_token 相同，检查 expires_at
+	if !isNewer && fileExpiresAt != "" && memExpiresAt != "" {
+		fileExpTime, fileParseErr := time.Parse(time.RFC3339, fileExpiresAt)
+		memExpTime, memParseErr := time.Parse(time.RFC3339, memExpiresAt)
+		if fileParseErr == nil && memParseErr == nil && fileExpTime.After(memExpTime) {
+			isNewer = true
+			log.Debugf("kiro executor: file expires_at (%s) is newer than memory (%s)", fileExpiresAt, memExpiresAt)
+		}
+	}
+
+	// 如果文件中没有 expires_at 但 access_token 相同，无法判断是否更新
+	if !isNewer && fileExpiresAt == "" && fileAccessToken == memAccessToken {
+		return nil, fmt.Errorf("kiro executor: cannot determine if file token is newer (no expires_at, same access_token)")
+	}
+
+	if !isNewer {
+		log.Debugf("kiro executor: file token not newer than memory token")
+		return nil, fmt.Errorf("kiro executor: file token not newer")
+	}
+
+	// 创建更新后的 auth 对象
+	updated := auth.Clone()
+	updated.Metadata = metadata
+	updated.UpdatedAt = time.Now()
+
+	// 同步更新 Attributes
+	if updated.Attributes == nil {
+		updated.Attributes = make(map[string]string)
+	}
+	if accessToken, ok := metadata["access_token"].(string); ok {
+		updated.Attributes["access_token"] = accessToken
+	}
+	if profileArn, ok := metadata["profile_arn"].(string); ok {
+		updated.Attributes["profile_arn"] = profileArn
+	}
+
+	log.Infof("kiro executor: reloaded auth from file %s, new expires_at: %s", authPath, fileExpiresAt)
+	return updated, nil
 }
 
 // isTokenExpired checks if a JWT access token has expired.
