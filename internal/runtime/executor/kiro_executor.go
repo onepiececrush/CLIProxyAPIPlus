@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -385,6 +386,35 @@ func buildKiroEndpointConfigs(region string) []kiroEndpointConfig {
 	}
 }
 
+// resolveKiroAPIRegion determines the AWS region for Kiro API calls.
+// Region priority:
+// 1. auth.Metadata["api_region"] - explicit API region override
+// 2. ProfileARN region - extracted from arn:aws:service:REGION:account:resource
+// 3. kiroDefaultRegion (us-east-1) - fallback
+// Note: OIDC "region" is NOT used - it's for token refresh, not API calls
+func resolveKiroAPIRegion(auth *cliproxyauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return kiroDefaultRegion
+	}
+	// Priority 1: Explicit api_region override
+	if r, ok := auth.Metadata["api_region"].(string); ok && r != "" {
+		log.Debugf("kiro: using region %s (source: api_region)", r)
+		return r
+	}
+	// Priority 2: Extract from ProfileARN
+	if profileArn, ok := auth.Metadata["profile_arn"].(string); ok && profileArn != "" {
+		if arnRegion := extractRegionFromProfileARN(profileArn); arnRegion != "" {
+			log.Debugf("kiro: using region %s (source: profile_arn)", arnRegion)
+			return arnRegion
+		}
+	}
+	// Note: OIDC "region" field is NOT used for API endpoint
+	// Kiro API only exists in us-east-1, while OIDC region can vary (e.g., ap-northeast-2)
+	// Using OIDC region for API calls causes DNS failures
+	log.Debugf("kiro: using region %s (source: default)", kiroDefaultRegion)
+	return kiroDefaultRegion
+}
+
 // kiroEndpointConfigs is kept for backward compatibility with default us-east-1 region.
 // Prefer using buildKiroEndpointConfigs(region) for dynamic region support.
 var kiroEndpointConfigs = buildKiroEndpointConfigs(kiroDefaultRegion)
@@ -403,30 +433,8 @@ func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
 		return kiroEndpointConfigs
 	}
 
-	// Determine API region with priority: api_region > profile_arn > region > default
-	region := kiroDefaultRegion
-	regionSource := "default"
-
-	if auth.Metadata != nil {
-		// Priority 1: Explicit api_region override
-		if r, ok := auth.Metadata["api_region"].(string); ok && r != "" {
-			region = r
-			regionSource = "api_region"
-		} else {
-			// Priority 2: Extract from ProfileARN
-			if profileArn, ok := auth.Metadata["profile_arn"].(string); ok && profileArn != "" {
-				if arnRegion := extractRegionFromProfileARN(profileArn); arnRegion != "" {
-					region = arnRegion
-					regionSource = "profile_arn"
-				}
-			}
-			// Note: OIDC "region" field is NOT used for API endpoint
-			// Kiro API only exists in us-east-1, while OIDC region can vary (e.g., ap-northeast-2)
-			// Using OIDC region for API calls causes DNS failures
-		}
-	}
-
-	log.Debugf("kiro: using region %s (source: %s)", region, regionSource)
+	// Determine API region using shared resolution logic
+	region := resolveKiroAPIRegion(auth)
 
 	// Build endpoint configs for the specified region
 	endpointConfigs := buildKiroEndpointConfigs(region)
@@ -519,8 +527,12 @@ func buildKiroPayloadForFormat(body []byte, modelID, profileArn, origin string, 
 	case "openai":
 		log.Debugf("kiro: using OpenAI payload builder for source format: %s", sourceFormat.String())
 		return kiroopenai.BuildKiroPayloadFromOpenAI(body, modelID, profileArn, origin, isAgentic, isChatOnly, headers, nil)
+	case "kiro":
+		// Body is already in Kiro format — pass through directly
+		log.Debugf("kiro: body already in Kiro format, passing through directly")
+		return body, false
 	default:
-		// Default to Claude format (also handles "claude", "kiro", etc.)
+		// Default to Claude format
 		log.Debugf("kiro: using Claude payload builder for source format: %s", sourceFormat.String())
 		return kiroclaude.BuildKiroPayload(body, modelID, profileArn, origin, isAgentic, isChatOnly, headers, nil)
 	}
@@ -636,10 +648,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	rateLimiter.WaitForToken(tokenKey)
 	log.Debugf("kiro: rate limiter cleared for token %s", tokenKey)
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
-	defer reporter.trackFailure(ctx, &err)
-
-	// Check if token is expired before making request
+	// Check if token is expired before making request (covers both normal and web_search paths)
 	if e.isTokenExpired(accessToken) {
 		log.Infof("kiro: access token expired, attempting recovery")
 
@@ -667,6 +676,16 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 			}
 		}
 	}
+
+	// Check for pure web_search request
+	// Route to MCP endpoint instead of normal Kiro API
+	if kiroclaude.HasWebSearchTool(req.Payload) {
+		log.Infof("kiro: detected pure web_search request (non-stream), routing to MCP endpoint")
+		return e.handleWebSearch(ctx, auth, req, opts, accessToken, profileArn)
+	}
+
+	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
@@ -1014,8 +1033,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 			// Build response in Claude format for Kiro translator
 			// stopReason is extracted from upstream response by parseEventStream
-			kiroResponse := kiroclaude.BuildClaudeResponse(content, toolUses, req.Model, usageInfo, stopReason)
-			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, kiroResponse, nil)
+			requestedModel := payloadRequestedModel(opts, req.Model)
+			kiroResponse := kiroclaude.BuildClaudeResponse(content, toolUses, requestedModel, usageInfo, stopReason)
+			out := sdktranslator.TranslateNonStream(ctx, to, from, requestedModel, bytes.Clone(opts.OriginalRequest), body, kiroResponse, nil)
 			resp = cliproxyexecutor.Response{Payload: []byte(out)}
 			return resp, nil
 		}
@@ -1033,7 +1053,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 // ExecuteStream handles streaming requests to Kiro API.
 // Supports automatic token refresh on 401/403 errors and quota fallback on 429.
-func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (stream <-chan cliproxyexecutor.StreamChunk, err error) {
+func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	accessToken, profileArn := kiroCredentials(auth)
 	if accessToken == "" {
 		return nil, fmt.Errorf("kiro: access token not found in auth")
@@ -1057,10 +1077,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	rateLimiter.WaitForToken(tokenKey)
 	log.Debugf("kiro: stream rate limiter cleared for token %s", tokenKey)
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
-	defer reporter.trackFailure(ctx, &err)
-
-	// Check if token is expired before making request
+	// Check if token is expired before making request (covers both normal and web_search paths)
 	if e.isTokenExpired(accessToken) {
 		log.Infof("kiro: access token expired, attempting recovery before stream request")
 
@@ -1089,6 +1106,20 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		}
 	}
 
+	// Check for pure web_search request
+	// Route to MCP endpoint instead of normal Kiro API
+	if kiroclaude.HasWebSearchTool(req.Payload) {
+		log.Infof("kiro: detected pure web_search request, routing to MCP endpoint")
+		streamWebSearch, errWebSearch := e.handleWebSearchStream(ctx, auth, req, opts, accessToken, profileArn)
+		if errWebSearch != nil {
+			return nil, errWebSearch
+		}
+		return &cliproxyexecutor.StreamResult{Chunks: streamWebSearch}, nil
+	}
+
+	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	defer reporter.trackFailure(ctx, &err)
+
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
@@ -1101,7 +1132,11 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 	// Execute stream with retry on 401/403 and 429 (quota exhausted)
 	// Note: currentOrigin and kiroPayload are built inside executeStreamWithRetry for each endpoint
-	return e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, reporter, "", kiroModelID, isAgentic, isChatOnly, tokenKey)
+	streamKiro, errStreamKiro := e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, reporter, "", kiroModelID, isAgentic, isChatOnly, tokenKey)
+	if errStreamKiro != nil {
+		return nil, errStreamKiro
+	}
+	return &cliproxyexecutor.StreamResult{Chunks: streamKiro}, nil
 }
 
 // executeStreamWithRetry performs the streaming HTTP request with automatic retry on auth errors.
@@ -1405,7 +1440,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				// So we always enable thinking parsing for Kiro responses
 				log.Debugf("kiro: stream thinkingEnabled = %v (always true for Kiro)", thinkingEnabled)
 
-				e.streamToChannel(ctx, resp.Body, out, from, req.Model, opts.OriginalRequest, body, reporter, thinkingEnabled)
+				e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), opts.OriginalRequest, body, reporter, thinkingEnabled)
 			}(httpResp, thinkingEnabled)
 
 			return out, nil
@@ -1681,6 +1716,8 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 	modelMap := map[string]string{
 		// Amazon Q format (amazonq- prefix) - same API as Kiro
 		"amazonq-auto":                       "auto",
+		"amazonq-claude-opus-4-6":            "claude-opus-4.6",
+		"amazonq-claude-sonnet-4-6":          "claude-sonnet-4.6",
 		"amazonq-claude-opus-4-5":            "claude-opus-4.5",
 		"amazonq-claude-sonnet-4-5":          "claude-sonnet-4.5",
 		"amazonq-claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
@@ -1688,6 +1725,8 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 		"amazonq-claude-sonnet-4-20250514":   "claude-sonnet-4",
 		"amazonq-claude-haiku-4-5":           "claude-haiku-4.5",
 		// Kiro format (kiro- prefix) - valid model names that should be preserved
+		"kiro-claude-opus-4-6":            "claude-opus-4.6",
+		"kiro-claude-sonnet-4-6":          "claude-sonnet-4.6",
 		"kiro-claude-opus-4-5":            "claude-opus-4.5",
 		"kiro-claude-sonnet-4-5":          "claude-sonnet-4.5",
 		"kiro-claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
@@ -1696,6 +1735,10 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 		"kiro-claude-haiku-4-5":           "claude-haiku-4.5",
 		"kiro-auto":                       "auto",
 		// Native format (no prefix) - used by Kiro IDE directly
+		"claude-opus-4-6":            "claude-opus-4.6",
+		"claude-opus-4.6":            "claude-opus-4.6",
+		"claude-sonnet-4-6":          "claude-sonnet-4.6",
+		"claude-sonnet-4.6":          "claude-sonnet-4.6",
 		"claude-opus-4-5":            "claude-opus-4.5",
 		"claude-opus-4.5":            "claude-opus-4.5",
 		"claude-haiku-4-5":           "claude-haiku-4.5",
@@ -1707,10 +1750,14 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 		"claude-sonnet-4-20250514":   "claude-sonnet-4",
 		"auto":                       "auto",
 		// Agentic variants (same backend model IDs, but with special system prompt)
+		"claude-opus-4.6-agentic":        "claude-opus-4.6",
+		"claude-sonnet-4.6-agentic":      "claude-sonnet-4.6",
 		"claude-opus-4.5-agentic":        "claude-opus-4.5",
 		"claude-sonnet-4.5-agentic":      "claude-sonnet-4.5",
 		"claude-sonnet-4-agentic":        "claude-sonnet-4",
 		"claude-haiku-4.5-agentic":       "claude-haiku-4.5",
+		"kiro-claude-opus-4-6-agentic":   "claude-opus-4.6",
+		"kiro-claude-sonnet-4-6-agentic": "claude-sonnet-4.6",
 		"kiro-claude-opus-4-5-agentic":   "claude-opus-4.5",
 		"kiro-claude-sonnet-4-5-agentic": "claude-sonnet-4.5",
 		"kiro-claude-sonnet-4-agentic":   "claude-sonnet-4",
@@ -1736,6 +1783,10 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 			log.Debugf("kiro: unknown Sonnet 3.7 model '%s', mapping to claude-3-7-sonnet-20250219", model)
 			return "claude-3-7-sonnet-20250219"
 		}
+		if strings.Contains(modelLower, "4-6") || strings.Contains(modelLower, "4.6") {
+			log.Debugf("kiro: unknown Sonnet 4.6 model '%s', mapping to claude-sonnet-4.6", model)
+			return "claude-sonnet-4.6"
+		}
 		if strings.Contains(modelLower, "4-5") || strings.Contains(modelLower, "4.5") {
 			log.Debugf("kiro: unknown Sonnet 4.5 model '%s', mapping to claude-sonnet-4.5", model)
 			return "claude-sonnet-4.5"
@@ -1747,6 +1798,10 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 
 	// Check for Opus variants
 	if strings.Contains(modelLower, "opus") {
+		if strings.Contains(modelLower, "4-6") || strings.Contains(modelLower, "4.6") {
+			log.Debugf("kiro: unknown Opus 4.6 model '%s', mapping to claude-opus-4.6", model)
+			return "claude-opus-4.6"
+		}
 		log.Debugf("kiro: unknown Opus model '%s', mapping to claude-opus-4.5", model)
 		return "claude-opus-4.5"
 	}
@@ -2096,6 +2151,22 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, []kiroclaude.Ki
 				}
 			}
 
+		case "contextUsageEvent":
+			// Handle context usage events from Kiro API
+			// Format: {"contextUsageEvent": {"contextUsagePercentage": 0.53}}
+			if ctxUsage, ok := event["contextUsageEvent"].(map[string]interface{}); ok {
+				if ctxPct, ok := ctxUsage["contextUsagePercentage"].(float64); ok {
+					upstreamContextPercentage = ctxPct
+					log.Debugf("kiro: parseEventStream received contextUsageEvent: %.2f%%", ctxPct*100)
+				}
+			} else {
+				// Try direct field (fallback)
+				if ctxPct, ok := event["contextUsagePercentage"].(float64); ok {
+					upstreamContextPercentage = ctxPct
+					log.Debugf("kiro: parseEventStream received contextUsagePercentage (direct): %.2f%%", ctxPct*100)
+				}
+			}
+
 		case "error", "exception", "internalServerException", "invalidStateEvent":
 			// Handle error events from Kiro API stream
 			errMsg := ""
@@ -2442,8 +2513,9 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte, reporter *usageReporter, thinkingEnabled bool) {
 	reader := bufio.NewReaderSize(body, 20*1024*1024) // 20MB buffer to match other providers
 	var totalUsage usage.Detail
-	var hasToolUses bool              // Track if any tool uses were emitted
-	var upstreamStopReason string     // Track stop_reason from upstream events
+	var hasToolUses bool          // Track if any tool uses were emitted
+	var hasTruncatedTools bool    // Track if any tool uses were truncated
+	var upstreamStopReason string // Track stop_reason from upstream events
 
 	// Tool use state tracking for input buffering and deduplication
 	processedIDs := make(map[string]bool)
@@ -2479,6 +2551,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	isThinkingBlockOpen := false                   // Track if thinking content block SSE event is open
 	thinkingBlockIndex := -1                       // Index of the thinking content block
 	var accumulatedThinkingContent strings.Builder // Accumulate thinking content for token counting
+	hasOfficialReasoningEvent := false             // Disable tag parsing after official reasoning events appear
 
 	// Buffer for handling partial tag matches at chunk boundaries
 	var pendingContent strings.Builder // Buffer content that might be part of a tag
@@ -2698,6 +2771,22 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				}
 			}
 
+		case "contextUsageEvent":
+			// Handle context usage events from Kiro API
+			// Format: {"contextUsageEvent": {"contextUsagePercentage": 0.53}}
+			if ctxUsage, ok := event["contextUsageEvent"].(map[string]interface{}); ok {
+				if ctxPct, ok := ctxUsage["contextUsagePercentage"].(float64); ok {
+					upstreamContextPercentage = ctxPct
+					log.Debugf("kiro: streamToChannel received contextUsageEvent: %.2f%%", ctxPct*100)
+				}
+			} else {
+				// Try direct field (fallback)
+				if ctxPct, ok := event["contextUsagePercentage"].(float64); ok {
+					upstreamContextPercentage = ctxPct
+					log.Debugf("kiro: streamToChannel received contextUsagePercentage (direct): %.2f%%", ctxPct*100)
+				}
+			}
+
 		case "error", "exception", "internalServerException":
 			// Handle error events from Kiro API stream
 			errMsg := ""
@@ -2896,6 +2985,31 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 					lastUsageUpdateLen = accumulatedContent.Len()
 					lastUsageUpdateTime = time.Now()
+				}
+
+				if hasOfficialReasoningEvent {
+					processText := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(contentDelta, kirocommon.ThinkingStartTag, ""), kirocommon.ThinkingEndTag, ""))
+					if processText != "" {
+						if !isTextBlockOpen {
+							contentBlockIndex++
+							isTextBlockOpen = true
+							blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "text", "", "")
+							sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
+							for _, chunk := range sseData {
+								if chunk != "" {
+									out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+								}
+							}
+						}
+						claudeEvent := kiroclaude.BuildClaudeStreamEvent(processText, contentBlockIndex)
+						sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, claudeEvent, &translatorParam)
+						for _, chunk := range sseData {
+							if chunk != "" {
+								out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+							}
+						}
+					}
+					continue
 				}
 
 				// TAG-BASED THINKING PARSING: Parse <thinking> tags from content
@@ -3176,6 +3290,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			}
 
 			if thinkingText != "" {
+				hasOfficialReasoningEvent = true
 				// Close text block if open before starting thinking block
 				if isTextBlockOpen && contentBlockIndex >= 0 {
 					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
@@ -3221,40 +3336,16 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			_ = signature // Signature can be used for verification if needed
 
 		case "toolUseEvent":
-			// Debug: log raw toolUseEvent payload for large tool inputs
-			if log.IsLevelEnabled(log.DebugLevel) {
-				payloadStr := string(payload)
-				if len(payloadStr) > 500 {
-					payloadStr = payloadStr[:500] + "...[truncated]"
-				}
-				log.Debugf("kiro: raw toolUseEvent payload (%d bytes): %s", len(payload), payloadStr)
-			}
 			// Handle dedicated tool use events with input buffering
 			completedToolUses, newState := kiroclaude.ProcessToolUseEvent(event, currentToolUse, processedIDs)
 			currentToolUse = newState
 
 			// Emit completed tool uses
 			for _, tu := range completedToolUses {
-				// Check for truncated write marker - emit as a Bash tool that echoes the error
-				// This way Claude Code will execute it, see the error, and the agent can retry
-				if tu.Name == "__truncated_write__" {
-					filePath := ""
-					if fp, ok := tu.Input["file_path"].(string); ok && fp != "" {
-						filePath = fp
-					}
-
-					// Create a Bash tool that echoes the error message
-					// This will be executed by Claude Code and the agent will see the result
-					var errorMsg string
-					if filePath != "" {
-						errorMsg = fmt.Sprintf("echo '[WRITE TOOL ERROR] The file content for \"%s\" is too large to be transmitted by the upstream API. You MUST retry by writing the file in smaller chunks: First use Write to create the file with the first 700 lines, then use multiple Edit operations to append the remaining content in chunks of ~700 lines each.'", filePath)
-					} else {
-						errorMsg = "echo '[WRITE TOOL ERROR] The file content is too large to be transmitted by the upstream API. The Write tool input was truncated. You MUST retry by writing the file in smaller chunks: First use Write to create the file with the first 700 lines, then use multiple Edit operations to append the remaining content in chunks of ~700 lines each.'"
-					}
-
-					log.Warnf("kiro: converting truncated write to Bash echo for file: %s", filePath)
-
-					hasToolUses = true
+				// Check if this tool was truncated - emit with SOFT_LIMIT_REACHED marker
+				if tu.IsTruncated {
+					hasTruncatedTools = true
+					log.Infof("kiro: streamToChannel emitting truncated tool with SOFT_LIMIT_REACHED: %s (ID: %s)", tu.Name, tu.ToolUseID)
 
 					// Close text block if open
 					if isTextBlockOpen && contentBlockIndex >= 0 {
@@ -3270,8 +3361,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 					contentBlockIndex++
 
-					// Emit as Bash tool_use
-					blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", tu.ToolUseID, "Bash")
+					// Emit tool_use with SOFT_LIMIT_REACHED marker input
+					blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", tu.ToolUseID, tu.Name)
 					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 					for _, chunk := range sseData {
 						if chunk != "" {
@@ -3279,16 +3370,14 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 						}
 					}
 
-					// Emit the Bash command as input
-					bashInput := map[string]interface{}{
-						"command": errorMsg,
+					// Build SOFT_LIMIT_REACHED marker input
+					markerInput := map[string]interface{}{
+						"_status":  "SOFT_LIMIT_REACHED",
+						"_message": "Tool output was truncated. Split content into smaller chunks (max 300 lines). Due to potential model hallucination, you MUST re-fetch the current working directory and generate the correct file_path.",
 					}
-					inputJSON, err := json.Marshal(bashInput)
-					if err != nil {
-						log.Errorf("kiro: failed to marshal bash input for truncated write error: %v", err)
-						continue
-					}
-					inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(string(inputJSON), contentBlockIndex)
+
+					markerJSON, _ := json.Marshal(markerInput)
+					inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(string(markerJSON), contentBlockIndex)
 					sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, inputDelta, &translatorParam)
 					for _, chunk := range sseData {
 						if chunk != "" {
@@ -3296,6 +3385,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 						}
 					}
 
+					// Close tool_use block
 					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
 					sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 					for _, chunk := range sseData {
@@ -3304,7 +3394,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 						}
 					}
 
-					continue // Skip the normal tool_use emission
+					hasToolUses = true // Keep this so stop_reason = tool_use
+					continue
 				}
 
 				hasToolUses = true
@@ -3605,7 +3696,12 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	}
 
 	// Determine stop reason: prefer upstream, then detect tool_use, default to end_turn
+	// SOFT_LIMIT_REACHED: Keep stop_reason = "tool_use" so Claude continues the loop
 	stopReason := upstreamStopReason
+	if hasTruncatedTools {
+		// Log that we're using SOFT_LIMIT_REACHED approach
+		log.Infof("kiro: streamToChannel using SOFT_LIMIT_REACHED - keeping stop_reason=tool_use for truncated tools")
+	}
 	if stopReason == "" {
 		if hasToolUses {
 			stopReason = "tool_use"
@@ -4076,6 +4172,659 @@ func (e *KiroExecutor) isTokenExpired(accessToken string) bool {
 	return isExpired
 }
 
-// NOTE: Message merging functions moved to internal/translator/kiro/common/message_merge.go
-// NOTE: Tool calling support functions moved to internal/translator/kiro/claude/kiro_claude_tools.go
-// The executor now uses kiroclaude.* and kirocommon.* functions instead
+// ══════════════════════════════════════════════════════════════════════════════
+// Web Search Handler (MCP API)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// fetchToolDescription caching:
+// Uses a mutex + fetched flag to ensure only one goroutine fetches at a time,
+// with automatic retry on failure:
+// - On failure, fetched stays false so subsequent calls will retry
+// - On success, fetched is set to true — subsequent calls skip immediately (mutex-free fast path)
+// The cached description is stored in the translator package via kiroclaude.SetWebSearchDescription(),
+// enabling the translator's convertClaudeToolsToKiro to read it when building Kiro requests.
+var (
+	toolDescMu      sync.Mutex
+	toolDescFetched atomic.Bool
+)
+
+// fetchToolDescription calls MCP tools/list to get the web_search tool description
+// and caches it. Safe to call concurrently — only one goroutine fetches at a time.
+// If the fetch fails, subsequent calls will retry. On success, no further fetches occur.
+// The httpClient parameter allows reusing a shared pooled HTTP client.
+func fetchToolDescription(ctx context.Context, mcpEndpoint, authToken string, httpClient *http.Client, auth *cliproxyauth.Auth, authAttrs map[string]string) {
+	// Fast path: already fetched successfully, no lock needed
+	if toolDescFetched.Load() {
+		return
+	}
+
+	toolDescMu.Lock()
+	defer toolDescMu.Unlock()
+
+	// Double-check after acquiring lock
+	if toolDescFetched.Load() {
+		return
+	}
+
+	handler := newWebSearchHandler(ctx, mcpEndpoint, authToken, httpClient, auth, authAttrs)
+	reqBody := []byte(`{"id":"tools_list","jsonrpc":"2.0","method":"tools/list"}`)
+	log.Debugf("kiro/websearch MCP tools/list request: %d bytes", len(reqBody))
+
+	req, err := http.NewRequestWithContext(ctx, "POST", mcpEndpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		log.Warnf("kiro/websearch: failed to create tools/list request: %v", err)
+		return
+	}
+
+	// Reuse same headers as callMcpAPI
+	handler.setMcpHeaders(req)
+
+	resp, err := handler.httpClient.Do(req)
+	if err != nil {
+		log.Warnf("kiro/websearch: tools/list request failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		log.Warnf("kiro/websearch: tools/list returned status %d", resp.StatusCode)
+		return
+	}
+	log.Debugf("kiro/websearch MCP tools/list response: [%d] %d bytes", resp.StatusCode, len(body))
+
+	// Parse: {"result":{"tools":[{"name":"web_search","description":"..."}]}}
+	var result struct {
+		Result *struct {
+			Tools []struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil || result.Result == nil {
+		log.Warnf("kiro/websearch: failed to parse tools/list response")
+		return
+	}
+
+	for _, tool := range result.Result.Tools {
+		if tool.Name == "web_search" && tool.Description != "" {
+			kiroclaude.SetWebSearchDescription(tool.Description)
+			toolDescFetched.Store(true) // success — no more fetches
+			log.Infof("kiro/websearch: cached web_search description from tools/list (%d bytes)", len(tool.Description))
+			return
+		}
+	}
+
+	// web_search tool not found in response
+	log.Warnf("kiro/websearch: web_search tool not found in tools/list response")
+}
+
+// webSearchHandler handles web search requests via Kiro MCP API
+type webSearchHandler struct {
+	ctx         context.Context
+	mcpEndpoint string
+	httpClient  *http.Client
+	authToken   string
+	auth        *cliproxyauth.Auth // for applyDynamicFingerprint
+	authAttrs   map[string]string  // optional, for custom headers from auth.Attributes
+}
+
+// newWebSearchHandler creates a new webSearchHandler.
+// If httpClient is nil, a default client with 30s timeout is used.
+// Pass a shared pooled client (e.g. from getKiroPooledHTTPClient) for connection reuse.
+func newWebSearchHandler(ctx context.Context, mcpEndpoint, authToken string, httpClient *http.Client, auth *cliproxyauth.Auth, authAttrs map[string]string) *webSearchHandler {
+	if httpClient == nil {
+		httpClient = &http.Client{
+			Timeout: 30 * time.Second,
+		}
+	}
+	return &webSearchHandler{
+		ctx:         ctx,
+		mcpEndpoint: mcpEndpoint,
+		httpClient:  httpClient,
+		authToken:   authToken,
+		auth:        auth,
+		authAttrs:   authAttrs,
+	}
+}
+
+// setMcpHeaders sets standard MCP API headers on the request,
+// aligned with the GAR request pattern.
+func (h *webSearchHandler) setMcpHeaders(req *http.Request) {
+	// 1. Content-Type & Accept (aligned with GAR)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+
+	// 2. Kiro-specific headers (aligned with GAR)
+	req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+	req.Header.Set("x-amzn-codewhisperer-optout", "true")
+
+	// 3. User-Agent: Reuse applyDynamicFingerprint for consistency
+	applyDynamicFingerprint(req, h.auth)
+
+	// 4. AWS SDK identifiers
+	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
+	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+
+	// 5. Authentication
+	req.Header.Set("Authorization", "Bearer "+h.authToken)
+
+	// 6. Custom headers from auth attributes
+	util.ApplyCustomHeadersFromAttrs(req, h.authAttrs)
+}
+
+// mcpMaxRetries is the maximum number of retries for MCP API calls.
+const mcpMaxRetries = 2
+
+// callMcpAPI calls the Kiro MCP API with the given request.
+// Includes retry logic with exponential backoff for retryable errors.
+func (h *webSearchHandler) callMcpAPI(request *kiroclaude.McpRequest) (*kiroclaude.McpResponse, error) {
+	requestBody, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal MCP request: %w", err)
+	}
+	log.Debugf("kiro/websearch MCP request → %s (%d bytes)", h.mcpEndpoint, len(requestBody))
+
+	var lastErr error
+	for attempt := 0; attempt <= mcpMaxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<attempt) * time.Second
+			if backoff > 10*time.Second {
+				backoff = 10 * time.Second
+			}
+			log.Warnf("kiro/websearch: MCP retry %d/%d after %v (last error: %v)", attempt, mcpMaxRetries, backoff, lastErr)
+			select {
+			case <-h.ctx.Done():
+				return nil, h.ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(h.ctx, "POST", h.mcpEndpoint, bytes.NewReader(requestBody))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+		}
+
+		h.setMcpHeaders(req)
+
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("MCP API request failed: %w", err)
+			continue // network error → retry
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read MCP response: %w", err)
+			continue // read error → retry
+		}
+		log.Debugf("kiro/websearch MCP response ← [%d] (%d bytes)", resp.StatusCode, len(body))
+
+		// Retryable HTTP status codes (aligned with GAR: 502, 503, 504)
+		if resp.StatusCode >= 502 && resp.StatusCode <= 504 {
+			lastErr = fmt.Errorf("MCP API returned retryable status %d: %s", resp.StatusCode, string(body))
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("MCP API returned status %d: %s", resp.StatusCode, string(body))
+		}
+
+		var mcpResponse kiroclaude.McpResponse
+		if err := json.Unmarshal(body, &mcpResponse); err != nil {
+			return nil, fmt.Errorf("failed to parse MCP response: %w", err)
+		}
+
+		if mcpResponse.Error != nil {
+			code := -1
+			if mcpResponse.Error.Code != nil {
+				code = *mcpResponse.Error.Code
+			}
+			msg := "Unknown error"
+			if mcpResponse.Error.Message != nil {
+				msg = *mcpResponse.Error.Message
+			}
+			return nil, fmt.Errorf("MCP error %d: %s", code, msg)
+		}
+
+		return &mcpResponse, nil
+	}
+
+	return nil, lastErr
+}
+
+// webSearchAuthAttrs extracts auth attributes for MCP calls.
+// Used by handleWebSearch and handleWebSearchStream to pass custom headers.
+func webSearchAuthAttrs(auth *cliproxyauth.Auth) map[string]string {
+	if auth != nil {
+		return auth.Attributes
+	}
+	return nil
+}
+
+const maxWebSearchIterations = 5
+
+// handleWebSearchStream handles web_search requests:
+// Step 1: tools/list (sync) → fetch/cache tool description
+// Step 2+: MCP search → InjectToolResultsClaude → callKiroAndBuffer loop
+// Note: We skip the "model decides to search" step because Claude Code already
+// decided to use web_search. The Kiro tool description restricts non-coding
+// topics, so asking the model again would cause it to refuse valid searches.
+func (e *KiroExecutor) handleWebSearchStream(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	req cliproxyexecutor.Request,
+	opts cliproxyexecutor.Options,
+	accessToken, profileArn string,
+) (<-chan cliproxyexecutor.StreamChunk, error) {
+	// Extract search query from Claude Code's web_search tool_use
+	query := kiroclaude.ExtractSearchQuery(req.Payload)
+	if query == "" {
+		log.Warnf("kiro/websearch: failed to extract search query, falling back to normal flow")
+		return e.callKiroDirectStream(ctx, auth, req, opts, accessToken, profileArn)
+	}
+
+	// Build MCP endpoint using shared region resolution (supports api_region + ProfileARN fallback)
+	region := resolveKiroAPIRegion(auth)
+	mcpEndpoint := kiroclaude.BuildMcpEndpoint(region)
+
+	// ── Step 1: tools/list (SYNC) — cache tool description ──
+	{
+		authAttrs := webSearchAuthAttrs(auth)
+		fetchToolDescription(ctx, mcpEndpoint, accessToken, newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 30*time.Second), auth, authAttrs)
+	}
+
+	// Create output channel
+	out := make(chan cliproxyexecutor.StreamChunk)
+
+	// Usage reporting: track web search requests like normal streaming requests
+	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
+
+	go func() {
+		var wsErr error
+		defer reporter.trackFailure(ctx, &wsErr)
+		defer close(out)
+
+		// Estimate input tokens using tokenizer (matching streamToChannel pattern)
+		var totalUsage usage.Detail
+		if enc, tokErr := getTokenizer(req.Model); tokErr == nil {
+			if inp, e := countClaudeChatTokens(enc, req.Payload); e == nil && inp > 0 {
+				totalUsage.InputTokens = inp
+			} else {
+				totalUsage.InputTokens = int64(len(req.Payload) / 4)
+			}
+		} else {
+			totalUsage.InputTokens = int64(len(req.Payload) / 4)
+		}
+		if totalUsage.InputTokens == 0 && len(req.Payload) > 0 {
+			totalUsage.InputTokens = 1
+		}
+		var accumulatedOutputLen int
+		defer func() {
+			if wsErr != nil {
+				return // let trackFailure handle failure reporting
+			}
+			totalUsage.OutputTokens = int64(accumulatedOutputLen / 4)
+			if accumulatedOutputLen > 0 && totalUsage.OutputTokens == 0 {
+				totalUsage.OutputTokens = 1
+			}
+			reporter.publish(ctx, totalUsage)
+		}()
+
+		// Send message_start event to client (aligned with streamToChannel pattern)
+		// Use payloadRequestedModel to return user's original model alias
+		msgStart := kiroclaude.BuildClaudeMessageStartEvent(
+			payloadRequestedModel(opts, req.Model),
+			totalUsage.InputTokens,
+		)
+		select {
+		case <-ctx.Done():
+			return
+		case out <- cliproxyexecutor.StreamChunk{Payload: append(msgStart, '\n', '\n')}:
+		}
+
+		// ── Step 2+: MCP search → InjectToolResultsClaude → callKiroAndBuffer loop ──
+		contentBlockIndex := 0
+		currentQuery := query
+
+		// Replace web_search tool description with a minimal one that allows re-search.
+		// The original tools/list description from Kiro restricts non-coding topics,
+		// but we've already decided to search. We keep the tool so the model can
+		// request additional searches when results are insufficient.
+		simplifiedPayload, simplifyErr := kiroclaude.ReplaceWebSearchToolDescription(bytes.Clone(req.Payload))
+		if simplifyErr != nil {
+			log.Warnf("kiro/websearch: failed to simplify web_search tool: %v, using original payload", simplifyErr)
+			simplifiedPayload = bytes.Clone(req.Payload)
+		}
+
+		currentClaudePayload := simplifiedPayload
+		totalSearches := 0
+
+		// Generate toolUseId for the first iteration (Claude Code already decided to search)
+		currentToolUseId := fmt.Sprintf("srvtoolu_%s", kiroclaude.GenerateToolUseID())
+
+		for iteration := 0; iteration < maxWebSearchIterations; iteration++ {
+			log.Infof("kiro/websearch: search iteration %d/%d",
+				iteration+1, maxWebSearchIterations)
+
+			// MCP search
+			_, mcpRequest := kiroclaude.CreateMcpRequest(currentQuery)
+
+			authAttrs := webSearchAuthAttrs(auth)
+			handler := newWebSearchHandler(ctx, mcpEndpoint, accessToken, newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 30*time.Second), auth, authAttrs)
+			mcpResponse, mcpErr := handler.callMcpAPI(mcpRequest)
+
+			var searchResults *kiroclaude.WebSearchResults
+			if mcpErr != nil {
+				log.Warnf("kiro/websearch: MCP API call failed: %v, continuing with empty results", mcpErr)
+			} else {
+				searchResults = kiroclaude.ParseSearchResults(mcpResponse)
+			}
+
+			resultCount := 0
+			if searchResults != nil {
+				resultCount = len(searchResults.Results)
+			}
+			totalSearches++
+			log.Infof("kiro/websearch: iteration %d — got %d search results", iteration+1, resultCount)
+
+			// Send search indicator events to client
+			searchEvents := kiroclaude.GenerateSearchIndicatorEvents(currentQuery, currentToolUseId, searchResults, contentBlockIndex)
+			for _, event := range searchEvents {
+				select {
+				case <-ctx.Done():
+					return
+				case out <- cliproxyexecutor.StreamChunk{Payload: event}:
+				}
+			}
+			contentBlockIndex += 2
+
+			// Inject tool_use + tool_result into Claude payload, then call GAR
+			var err error
+			currentClaudePayload, err = kiroclaude.InjectToolResultsClaude(currentClaudePayload, currentToolUseId, currentQuery, searchResults)
+			if err != nil {
+				log.Warnf("kiro/websearch: failed to inject tool results: %v", err)
+				wsErr = fmt.Errorf("failed to inject tool results: %w", err)
+				e.sendFallbackText(ctx, out, contentBlockIndex, currentQuery, searchResults)
+				return
+			}
+
+			// Call GAR with modified Claude payload (full translation pipeline)
+			modifiedReq := req
+			modifiedReq.Payload = currentClaudePayload
+			kiroChunks, kiroErr := e.callKiroAndBuffer(ctx, auth, modifiedReq, opts, accessToken, profileArn)
+			if kiroErr != nil {
+				log.Warnf("kiro/websearch: Kiro API failed at iteration %d: %v", iteration+1, kiroErr)
+				wsErr = fmt.Errorf("Kiro API failed at iteration %d: %w", iteration+1, kiroErr)
+				e.sendFallbackText(ctx, out, contentBlockIndex, currentQuery, searchResults)
+				return
+			}
+
+			// Analyze response
+			analysis := kiroclaude.AnalyzeBufferedStream(kiroChunks)
+			log.Infof("kiro/websearch: iteration %d — stop_reason: %s, has_tool_use: %v",
+				iteration+1, analysis.StopReason, analysis.HasWebSearchToolUse)
+
+			if analysis.HasWebSearchToolUse && analysis.WebSearchQuery != "" && iteration+1 < maxWebSearchIterations {
+				// Model wants another search
+				filteredChunks := kiroclaude.FilterChunksForClient(kiroChunks, analysis.WebSearchToolUseIndex, contentBlockIndex)
+				for _, chunk := range filteredChunks {
+					select {
+					case <-ctx.Done():
+						return
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
+					}
+				}
+
+				currentQuery = analysis.WebSearchQuery
+				currentToolUseId = analysis.WebSearchToolUseId
+				continue
+			}
+
+			// Model returned final response — stream to client
+			for _, chunk := range kiroChunks {
+				if contentBlockIndex > 0 && len(chunk) > 0 {
+					adjusted, shouldForward := kiroclaude.AdjustSSEChunk(chunk, contentBlockIndex)
+					if !shouldForward {
+						continue
+					}
+					accumulatedOutputLen += len(adjusted)
+					select {
+					case <-ctx.Done():
+						return
+					case out <- cliproxyexecutor.StreamChunk{Payload: adjusted}:
+					}
+				} else {
+					accumulatedOutputLen += len(chunk)
+					select {
+					case <-ctx.Done():
+						return
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
+					}
+				}
+			}
+			log.Infof("kiro/websearch: completed after %d search iteration(s), total searches: %d", iteration+1, totalSearches)
+			return
+		}
+
+		log.Warnf("kiro/websearch: reached max iterations (%d), stopping search loop", maxWebSearchIterations)
+	}()
+
+	return out, nil
+}
+
+// handleWebSearch handles web_search requests for non-streaming Execute path.
+// Performs MCP search synchronously, injects results into the request payload,
+// then calls the normal non-streaming Kiro API path which returns a proper
+// Claude JSON response (not SSE chunks).
+func (e *KiroExecutor) handleWebSearch(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	req cliproxyexecutor.Request,
+	opts cliproxyexecutor.Options,
+	accessToken, profileArn string,
+) (cliproxyexecutor.Response, error) {
+	// Extract search query from Claude Code's web_search tool_use
+	query := kiroclaude.ExtractSearchQuery(req.Payload)
+	if query == "" {
+		log.Warnf("kiro/websearch: non-stream: failed to extract search query, falling back to normal Execute")
+		// Fall through to normal non-streaming path
+		return e.executeNonStreamFallback(ctx, auth, req, opts, accessToken, profileArn)
+	}
+
+	// Build MCP endpoint using shared region resolution (supports api_region + ProfileARN fallback)
+	region := resolveKiroAPIRegion(auth)
+	mcpEndpoint := kiroclaude.BuildMcpEndpoint(region)
+
+	// Step 1: Fetch/cache tool description (sync)
+	{
+		authAttrs := webSearchAuthAttrs(auth)
+		fetchToolDescription(ctx, mcpEndpoint, accessToken, newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 30*time.Second), auth, authAttrs)
+	}
+
+	// Step 2: Perform MCP search
+	_, mcpRequest := kiroclaude.CreateMcpRequest(query)
+
+	authAttrs := webSearchAuthAttrs(auth)
+	handler := newWebSearchHandler(ctx, mcpEndpoint, accessToken, newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 30*time.Second), auth, authAttrs)
+	mcpResponse, mcpErr := handler.callMcpAPI(mcpRequest)
+
+	var searchResults *kiroclaude.WebSearchResults
+	if mcpErr != nil {
+		log.Warnf("kiro/websearch: non-stream: MCP API call failed: %v, continuing with empty results", mcpErr)
+	} else {
+		searchResults = kiroclaude.ParseSearchResults(mcpResponse)
+	}
+
+	resultCount := 0
+	if searchResults != nil {
+		resultCount = len(searchResults.Results)
+	}
+	log.Infof("kiro/websearch: non-stream: got %d search results", resultCount)
+
+	// Step 3: Replace restrictive web_search tool description (align with streaming path)
+	simplifiedPayload, simplifyErr := kiroclaude.ReplaceWebSearchToolDescription(bytes.Clone(req.Payload))
+	if simplifyErr != nil {
+		log.Warnf("kiro/websearch: non-stream: failed to simplify web_search tool: %v, using original payload", simplifyErr)
+		simplifiedPayload = bytes.Clone(req.Payload)
+	}
+
+	// Step 4: Inject search tool_use + tool_result into Claude payload
+	currentToolUseId := fmt.Sprintf("srvtoolu_%s", kiroclaude.GenerateToolUseID())
+	modifiedPayload, err := kiroclaude.InjectToolResultsClaude(simplifiedPayload, currentToolUseId, query, searchResults)
+	if err != nil {
+		log.Warnf("kiro/websearch: non-stream: failed to inject tool results: %v, falling back", err)
+		return e.executeNonStreamFallback(ctx, auth, req, opts, accessToken, profileArn)
+	}
+
+	// Step 5: Call Kiro API via the normal non-streaming path (executeWithRetry)
+	// This path uses parseEventStream → BuildClaudeResponse → TranslateNonStream
+	// to produce a proper Claude JSON response
+	modifiedReq := req
+	modifiedReq.Payload = modifiedPayload
+
+	resp, err := e.executeNonStreamFallback(ctx, auth, modifiedReq, opts, accessToken, profileArn)
+	if err != nil {
+		return resp, err
+	}
+
+	// Step 6: Inject server_tool_use + web_search_tool_result into response
+	// so Claude Code can display "Did X searches in Ys"
+	indicators := []kiroclaude.SearchIndicator{
+		{
+			ToolUseID: currentToolUseId,
+			Query:     query,
+			Results:   searchResults,
+		},
+	}
+	injectedPayload, injErr := kiroclaude.InjectSearchIndicatorsInResponse(resp.Payload, indicators)
+	if injErr != nil {
+		log.Warnf("kiro/websearch: non-stream: failed to inject search indicators: %v", injErr)
+	} else {
+		resp.Payload = injectedPayload
+	}
+
+	return resp, nil
+}
+
+// callKiroAndBuffer calls the Kiro API and buffers all response chunks.
+// Returns the buffered chunks for analysis before forwarding to client.
+// Usage reporting is NOT done here — the caller (handleWebSearchStream) manages its own reporter.
+func (e *KiroExecutor) callKiroAndBuffer(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	req cliproxyexecutor.Request,
+	opts cliproxyexecutor.Options,
+	accessToken, profileArn string,
+) ([][]byte, error) {
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("kiro")
+	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+	log.Debugf("kiro/websearch GAR request: %d bytes", len(body))
+
+	kiroModelID := e.mapModelToKiro(req.Model)
+	isAgentic, isChatOnly := determineAgenticMode(req.Model)
+	effectiveProfileArn := getEffectiveProfileArnWithWarning(auth, profileArn)
+
+	tokenKey := getTokenKey(auth)
+
+	kiroStream, err := e.executeStreamWithRetry(
+		ctx, auth, req, opts, accessToken, effectiveProfileArn,
+		nil, body, from, nil, "", kiroModelID, isAgentic, isChatOnly, tokenKey,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Buffer all chunks
+	var chunks [][]byte
+	for chunk := range kiroStream {
+		if chunk.Err != nil {
+			return chunks, chunk.Err
+		}
+		if len(chunk.Payload) > 0 {
+			chunks = append(chunks, bytes.Clone(chunk.Payload))
+		}
+	}
+
+	log.Debugf("kiro/websearch GAR response: %d chunks buffered", len(chunks))
+
+	return chunks, nil
+}
+
+// callKiroDirectStream creates a direct streaming channel to Kiro API without search.
+func (e *KiroExecutor) callKiroDirectStream(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	req cliproxyexecutor.Request,
+	opts cliproxyexecutor.Options,
+	accessToken, profileArn string,
+) (<-chan cliproxyexecutor.StreamChunk, error) {
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("kiro")
+	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+
+	kiroModelID := e.mapModelToKiro(req.Model)
+	isAgentic, isChatOnly := determineAgenticMode(req.Model)
+	effectiveProfileArn := getEffectiveProfileArnWithWarning(auth, profileArn)
+
+	tokenKey := getTokenKey(auth)
+
+	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	var streamErr error
+	defer reporter.trackFailure(ctx, &streamErr)
+
+	stream, streamErr := e.executeStreamWithRetry(
+		ctx, auth, req, opts, accessToken, effectiveProfileArn,
+		nil, body, from, reporter, "", kiroModelID, isAgentic, isChatOnly, tokenKey,
+	)
+	return stream, streamErr
+}
+
+// sendFallbackText sends a simple text response when the Kiro API fails during the search loop.
+// Delegates SSE event construction to kiroclaude.BuildFallbackTextEvents() for alignment
+// with how streamToChannel() uses BuildClaude*Event() functions.
+func (e *KiroExecutor) sendFallbackText(
+	ctx context.Context,
+	out chan<- cliproxyexecutor.StreamChunk,
+	contentBlockIndex int,
+	query string,
+	searchResults *kiroclaude.WebSearchResults,
+) {
+	events := kiroclaude.BuildFallbackTextEvents(contentBlockIndex, query, searchResults)
+	for _, event := range events {
+		select {
+		case <-ctx.Done():
+			return
+		case out <- cliproxyexecutor.StreamChunk{Payload: append(event, '\n', '\n')}:
+		}
+	}
+}
+
+// executeNonStreamFallback runs the standard non-streaming Execute path for a request.
+// Used by handleWebSearch after injecting search results, or as a fallback.
+func (e *KiroExecutor) executeNonStreamFallback(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	req cliproxyexecutor.Request,
+	opts cliproxyexecutor.Options,
+	accessToken, profileArn string,
+) (cliproxyexecutor.Response, error) {
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("kiro")
+	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+
+	kiroModelID := e.mapModelToKiro(req.Model)
+	isAgentic, isChatOnly := determineAgenticMode(req.Model)
+	effectiveProfileArn := getEffectiveProfileArnWithWarning(auth, profileArn)
+	tokenKey := getTokenKey(auth)
+
+	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	var err error
+	defer reporter.trackFailure(ctx, &err)
+
+	resp, err := e.executeWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, to, reporter, "", kiroModelID, isAgentic, isChatOnly, tokenKey)
+	return resp, err
+}

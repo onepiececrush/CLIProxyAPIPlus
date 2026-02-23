@@ -3,16 +3,18 @@ cli-proxy-api
 cliproxy
 *.exe
 
+
 # Configuration
 config.yaml
 .env
-
+.mcp.json
 # Generated content
 bin/*
 logs/*
 conv/*
 temp/*
 refs/*
+tmp/*
 
 # Storage backends
 pgstore/*
